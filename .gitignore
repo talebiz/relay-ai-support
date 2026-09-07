@@ -1,0 +1,28 @@
+# --- Environment ---
+.env
+
+# --- Python ---
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# --- Django ---
+*.sqlite3
+staticfiles/
+media/
+
+# --- Node / React ---
+node_modules/
+dist/
+.vite/
+
+# --- Docker ---
+# (named volumes are managed by Docker itself, not the filesystem here)
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,18 @@
+# --- Messaging ---
+pika==1.3.2                    # RabbitMQ consumer/publisher
+
+# --- Agent framework ---
+langgraph==0.2.62
+langchain-core==0.3.28
+
+# --- Vector store client (for the retrieval tool) ---
+chromadb==0.5.23
+
+# --- Database access (worker needs to read/write via the same schema) ---
+psycopg[binary]==3.2.3
+
+# --- Observability ---
+langfuse==2.53.9
+
+# --- Environment variables ---
+python-dotenv==1.0.1
