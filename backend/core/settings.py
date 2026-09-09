@@ -8,6 +8,7 @@ with a plain venv + a local .env file.
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -45,13 +46,21 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     # Third-party
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     # Local apps
     "health",
+    "accounts",
+    "orders",
     # More apps go here as they're created, e.g.:
-    # "accounts",
-    # "orders",
+    # "support",
 ]
+
+# Custom user model. See accounts/models.py for why this exists even
+# though it only adds a `role` field today: swapping user models after
+# migrations already reference auth.User is painful, so we do it once,
+# up front, rather than retrofitting it when the RBAC bonus is tackled.
+AUTH_USER_MODEL = "accounts.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -137,9 +146,28 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
+    # Deny-by-default: every view must explicitly opt into anything
+    # looser than "you must be logged in". This is the DRF-level half
+    # of "authorization lives in code" - nothing is world-readable by
+    # accident just because a view forgot to set permission_classes.
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+}
+
+# --- JWT (djangorestframework-simplejwt) ---
+# Short-lived access tokens + refresh tokens is the standard tradeoff
+# for an SPA talking to a separate API origin (no shared session cookie
+# domain to lean on). The AI worker never issues or verifies tokens
+# itself - Django is the only component that authenticates a user; the
+# worker only ever receives an already-resolved user id inside a
+# command message (see ai-worker's message envelope, part 3).
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
 
