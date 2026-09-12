@@ -52,8 +52,14 @@ INSTALLED_APPS = [
     "health",
     "accounts",
     "orders",
-    # More apps go here as they're created, e.g.:
-    # "support",
+    # Part 3: event-driven architecture (RabbitMQ). See each app's
+    # docstrings for what it owns:
+    #   - messaging:  shared envelope, topology, publisher, idempotency model
+    #   - support:    HTTP entry point that turns a request into a command
+    #   - streaming:  SSE view that turns RabbitMQ events into a browser stream
+    "messaging",
+    "support",
+    "streaming",
 ]
 
 # Custom user model. See accounts/models.py for why this exists even
@@ -161,7 +167,7 @@ REST_FRAMEWORK = {
 # domain to lean on). The AI worker never issues or verifies tokens
 # itself - Django is the only component that authenticates a user; the
 # worker only ever receives an already-resolved user id inside a
-# command message (see ai-worker's message envelope, part 3).
+# command message (see messaging/envelope.py, part 3).
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
@@ -180,3 +186,11 @@ CORS_ALLOWED_ORIGINS = [
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
     if origin.strip()
 ]
+
+
+# --- RabbitMQ (part 3: event-driven architecture) ---
+# Connection details are read directly from env vars by
+# messaging/publisher.py and streaming/views.py rather than duplicated
+# here, since neither pika nor aio-pika hook into Django's settings
+# system the way DATABASES does. Kept as plain os.getenv calls at the
+# point of use - see those modules.

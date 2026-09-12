@@ -8,7 +8,8 @@ langchain-core==0.3.28
 # --- Vector store client (for the retrieval tool) ---
 chromadb==0.5.23
 
-# --- Database access (worker needs to read/write via the same schema) ---
+# --- Database access (worker needs to read/write via the same schema,
+#     for the idempotency table - see db.py) ---
 psycopg[binary]==3.2.3
 
 # --- Observability ---
