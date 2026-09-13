@@ -41,6 +41,21 @@ Two groups of functions live here:
 Neither idempotency function on its own is a complete guarantee - see
 the module docstring in worker.py for the honest limitation this
 leaves.
+
+Part 4 commit 2 adds a third group: authorization-scoped reads/writes
+against `orders_order` and `orders_refundrequest`
+(fetch_order_for_user, fetch_refund_history_for_order,
+insert_refund_request). These exist because the two database tools
+(tools/order_tools.py, tools/action_tools.py) need to run the EXACT
+SAME "a user may only see their own rows, unless they are a support
+agent" rule that backend/orders/services.py enforces for the human-
+facing REST API - the worker cannot import that Django module (it is
+not a Django app, see this file's top docstring), so the rule is
+re-implemented here in plain SQL. This is intentional duplication, not
+an oversight: see tools/order_tools.py's module docstring for why
+duplicating the RULE (while sharing nothing else) is exactly what
+"authorization lives in code, not in the prompt" requires even across
+two separate services.
 """
 
 from __future__ import annotations
@@ -50,6 +65,7 @@ import uuid
 from contextlib import contextmanager
 
 import psycopg
+from psycopg.rows import dict_row
 
 DB_HOST = os.getenv("DB_HOST", "postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -79,6 +95,25 @@ def transaction():
     try:
         with conn:  # psycopg commits on clean exit, rolls back on exception
             with conn.cursor() as cur:
+                yield cur
+    finally:
+        conn.close()
+
+
+@contextmanager
+def transaction_dict_rows():
+    """
+    Same as `transaction()`, but the cursor returns dict rows (column
+    name -> value) instead of plain tuples. Used by the read-heavy
+    tool functions below, where returning a dict straight to the LLM
+    (as tool output) is far less error-prone than positional tuple
+    unpacking that would silently break if a SELECT's column order
+    ever changed.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor(row_factory=dict_row) as cur:
                 yield cur
     finally:
         conn.close()
@@ -195,3 +230,179 @@ def save_assistant_message(conversation_id: str, content: str) -> str:
             (message_id, conversation_id, "assistant", content),
         )
     return message_id
+
+
+def save_assistant_message_with_tool_calls(
+    conversation_id: str, content: str, tool_calls_json: str | None
+) -> str:
+    """
+    Same as `save_assistant_message`, but also records the tool-call
+    trace (as a JSON string, or None if the agent used no tools for
+    this turn) in `Message.tool_calls_json` - the field
+    conversations/models.py added specifically so a future "agent
+    activity" panel in the UI can render which tools were used,
+    without re-deriving that from the AGENT_TOOL_CALLED events (which,
+    unlike this row, are not guaranteed to still be reachable after an
+    SSE reconnect - see conversations/models.py's docstring, point 4).
+    """
+    message_id = str(uuid.uuid4())
+    with transaction() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO conversations_message
+                (id, conversation_id, role, content, tool_calls_json, created_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            """,
+            (message_id, conversation_id, "assistant", content, tool_calls_json),
+        )
+    return message_id
+
+
+def _acting_user_is_support_agent(acting_user_id: int) -> bool:
+    """
+    Re-derives the exact same role check as
+    accounts/permissions.py::IsSupportAgent, but from the database
+    directly rather than a Django `request.user` object, since the
+    worker has no Django request cycle. `role` is read from
+    `accounts_user` - the same column, the same values
+    ("support_agent"), the same authorization meaning - never
+    something the LLM is asked about or could influence.
+    """
+    with transaction_dict_rows() as cursor:
+        cursor.execute(
+            "SELECT role FROM accounts_user WHERE id = %s",
+            (acting_user_id,),
+        )
+        row = cursor.fetchone()
+    return bool(row) and row["role"] == "support_agent"
+
+
+def fetch_order_for_user(acting_user_id: int, order_id: str) -> dict | None:
+    """
+    The tool-side equivalent of backend/orders/services.py::get_order_for_user.
+
+    Returns the order as a plain dict (joined with product name/price
+    so the tool's output is immediately useful to the LLM without a
+    second lookup), or None if the order does not exist OR does not
+    belong to `acting_user_id` and the acting user is not a support
+    agent - deliberately indistinguishable, the same "can't tell
+    missing from forbidden" property the REST API guarantees
+    (orders/services.py's docstring explains why that distinction
+    itself would leak information).
+
+    This is a SELECT with the ownership check baked directly into the
+    WHERE clause (support agents get no WHERE-user filter at all)
+    rather than "fetch then check in Python" - so there is no code
+    path where a row for another user's order is ever pulled into this
+    process's memory in the first place, for a plain customer.
+    """
+    try:
+        uuid.UUID(str(order_id))
+    except (ValueError, TypeError):
+        return None
+    
+    is_agent = _acting_user_is_support_agent(acting_user_id)
+
+    query = """
+        SELECT
+            o.id, o.quantity, o.status, o.tracking_number,
+            o.created_at, o.user_id,
+            p.name AS product_name, p.price_cents,
+            u.username
+        FROM orders_order o
+        JOIN orders_product p ON p.id = o.product_id
+        JOIN accounts_user u ON u.id = o.user_id
+        WHERE o.id = %s
+    """
+    params: tuple = (order_id,)
+    if not is_agent:
+        query += " AND o.user_id = %s"
+        params = (order_id, acting_user_id)
+
+    with transaction_dict_rows() as cursor:
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    row["total_cents"] = row["price_cents"] * row["quantity"]
+    return row
+
+
+def fetch_refund_history_for_order(acting_user_id: int, order_id: str) -> list[dict] | None:
+    """
+    The tool-side equivalent of
+    backend/orders/services.py::refund_history_for_order.
+
+    Returns None (not an empty list) if the order itself is not
+    visible to `acting_user_id`, so the caller (tools/order_tools.py)
+    can distinguish "order not found/not yours" from "order exists,
+    zero refund requests on file" - the same distinction
+    orders/services.py preserves by resolving the order first via
+    get_order_for_user before ever touching RefundRequest.
+    """
+    order = fetch_order_for_user(acting_user_id, order_id)
+    if order is None:
+        return None
+
+    with transaction_dict_rows() as cursor:
+        cursor.execute(
+            """
+            SELECT id, reason, status, resolution_note, created_at
+            FROM orders_refundrequest
+            WHERE order_id = %s
+            ORDER BY created_at DESC
+            """,
+            (order_id,),
+        )
+        return cursor.fetchall()
+
+
+def insert_refund_request(acting_user_id: int, order_id: str, reason: str) -> dict | None:
+    """
+    The tool-side equivalent of
+    backend/orders/services.py::create_refund_request - the one
+    "action" tool the project brief requires at least one of (section
+    2: at least one tool that performs an action rather than just
+    reading data).
+
+    Re-resolves the order through `fetch_order_for_user` FIRST, so a
+    customer cannot file a refund against an order that is not
+    visible to them by guessing a UUID - identical ownership rule as
+    every read path above, applied here to a write. The refund is
+    always recorded against the ORDER's owner (`order["user_id"]`),
+    matching create_refund_request's own comment: a support agent
+    filing this on a customer's behalf still credits the customer, not
+    the agent.
+
+    Returns None if the order isn't visible to acting_user_id (caller
+    reports "order not found"); otherwise the newly created refund
+    request as a dict.
+    """
+    try:
+        uuid.UUID(str(order_id))
+    except (ValueError, TypeError):
+        return None
+    
+    order = fetch_order_for_user(acting_user_id, order_id)
+    if order is None:
+        return None
+
+    refund_id = str(uuid.uuid4())
+    with transaction() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO orders_refundrequest
+                (id, user_id, order_id, reason, status, resolution_note, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'requested', '', now(), now())
+            """,
+            (refund_id, order["user_id"], order_id, reason),
+        )
+
+    return {
+        "id": refund_id,
+        "order_id": order_id,
+        "reason": reason,
+        "status": "requested",
+    }

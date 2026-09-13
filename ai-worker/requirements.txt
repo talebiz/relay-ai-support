@@ -14,11 +14,15 @@ langchain-openai==0.2.14
 langchain-anthropic==0.3.1
 langchain-google-genai==2.0.7
 
-# --- Vector store client (for the retrieval tool) ---
+# --- Vector store client (part 4 commit 2: tools/knowledge_base_tools.py) ---
 chromadb==0.5.23
 
+# --- Web search tool (part 4 commit 2: tools/web_search_tools.py, Tavily HTTP API) ---
+httpx==0.27.2
+
 # --- Database access (worker needs to read/write via the same schema,
-#     for idempotency and conversation history - see db.py) ---
+#     for idempotency, conversation history, and the order/refund
+#     tools - see db.py) ---
 psycopg[binary]==3.2.3
 
 # --- Observability ---

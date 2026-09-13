@@ -1,11 +1,10 @@
 """
 Provider-agnostic LLM factory for the AI worker.
 
-Project brief, section 3 ("مدل زبانی و سرویس‌دهنده‌ها"): the LLM API
-cost is on us, so this project targets whatever free-tier provider is
-available, and the bonus list explicitly names automatic fallback to a
-second model when the first one fails ("بازگشت خودکار به مدل دوم هنگام
-شکست مدل اول").
+Project brief, section 3: the LLM API cost is on us, so this project
+targets whatever free-tier provider is available, and the bonus list
+explicitly names automatic fallback to a second model when the first
+one fails.
 
 Design:
 
@@ -17,10 +16,10 @@ Design:
    works for all of them without a provider-specific package each.
 
 2. `build_chat_model` is the ONLY place that imports a provider-specific
-   LangChain integration package. The agent code added in part 4
-   commit 2 will only ever depend on `BaseChatModel` - it does not know
-   or care which concrete provider is behind it. Adding a fourth
-   provider later means editing this one function, nothing else.
+   LangChain integration package. The agent graph (graph/agent_graph.py)
+   only ever depends on `BaseChatModel` - it does not know or care
+   which concrete provider is behind it. Adding a fourth provider later
+   means editing this one function, nothing else.
 
 3. `build_model_with_fallback` wires the fallback chain using
    LangChain's own `.with_fallbacks()`, rather than a hand-rolled

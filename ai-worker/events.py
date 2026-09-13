@@ -5,8 +5,7 @@ Every event MUST carry the same correlation_id as the command that
 triggered it - this is what lets the SSE view (backend/streaming/views.py)
 find the right browser connection to deliver it to, and what lets a
 Langfuse trace and this event stream be tied back together during the
-defense (project brief 3(a): "correlation_id باید کل مسیر را به هم وصل
-کند: درخواست، فرمان، اجرای worker، رد Langfuse و SSE").
+defense (project brief 3(a)).
 """
 
 from __future__ import annotations

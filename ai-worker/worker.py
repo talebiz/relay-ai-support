@@ -15,20 +15,30 @@ What this file implements (project brief, section 3):
         with exponential backoff via staged retry queues, and
         idempotency enforced in the database (db.py).
 
-Part 4, commit 1 update: `run_agent_placeholder`'s echo has been
-replaced by `run_agent`, which makes a REAL (but still tool-less,
-single LLM call) reply: it loads the conversation's history from the
-database (db.fetch_conversation_history), calls the configured LLM via
-llm/factory.py (with automatic provider fallback), streams the reply
-back as buffered delta events, and persists the final text
-(db.save_assistant_message) as the system of record. What it still
-does NOT do: call any tool (database lookup, RAG, web search, refund
-action) or run inside a LangGraph loop - the model can only rely on
-conversation history, not look anything up. That is part 4 commit 2,
-once the graph and its four tools exist. Everything AROUND the agent
-call (idempotency, ack/nack, retry, DLQ, event publishing) is
-unchanged from part 3 and will not need to change again when the real
-graph is added in commit 2 - only `run_agent`'s body will.
+Part 4 commit 2 update: `run_agent` no longer makes a single tool-less
+LLM call. It now builds and runs the real LangGraph agent
+(graph/agent_graph.py), bound to the four tools the project brief
+requires (database, document retrieval, web search, one action tool),
+and streams BOTH the model's text deltas and real tool-call events as
+they happen. What changed, concretely, versus commit 1:
+
+  - `run_agent` now calls `graph/agent_graph.py::build_agent_graph`
+    (scoped to this command's acting_user_id) instead of calling
+    `model.stream(...)` directly on a fixed message list.
+  - The agent may now call tools mid-run; every tool call publishes a
+    REAL `AGENT_TOOL_CALLED` event (name + arguments + result), not a
+    placeholder.
+  - The final assistant message persisted to the database
+    (db.save_assistant_message_with_tool_calls) now also carries the
+    tool-call trace, for a future "agent activity" panel to render.
+
+Everything AROUND the agent call - idempotency, ack/nack, retry, DLQ,
+the outer event publishing shape (AGENT_RUN_STARTED /
+AGENT_RESPONSE_CHUNK / AGENT_RUN_COMPLETED / AGENT_RUN_FAILED) - is
+UNCHANGED from commits 1 and part 3, exactly as commit 1's own
+docstring predicted: "Everything AROUND the agent call ... will not
+need to change again when the real graph is added in commit 2 - only
+run_agent's body will."
 
 --- The two required answers (project brief, section 3(b)) ---
 
@@ -49,7 +59,11 @@ A1: See `handle_command`, two layers:
     Layer 1 is what makes the common case cheap; layer 2 is what makes
     the guarantee actually hold under a race. See "Known limitation"
     below for the one case even layer 2 does not fully close: events
-    already published to RabbitMQ before the crash.
+    already published to RabbitMQ before the crash - and, as of commit
+    2, any tool side-effect (e.g. a RefundRequest row) executed before
+    the crash. Tool side-effects carry the same caveat as published
+    events: see tools/action_tools.py's own docstring for the accepted
+    limitation this leaves for create_refund_request specifically.
 
 Q2: "اگر worker پیش از تأیید از کار بیفتد چه می‌شود؟"
     (What happens if the worker crashes before acking?)
@@ -69,22 +83,23 @@ A2: RabbitMQ only removes a message from the queue when it receives an
 The idempotency guarantee above (Q1) is enforced by a PostgreSQL UNIQUE
 constraint, which only protects work that is still inside the open
 database transaction when a crash happens. Publishing an event to
-RabbitMQ (`publish_event`, called from `run_agent`) is a SEPARATE
-system from PostgreSQL - the two cannot be committed together as one
-atomic unit without a more advanced pattern (e.g. a transactional
-outbox), which is out of scope for this project's size.
+RabbitMQ (`publish_event`) is a SEPARATE system from PostgreSQL - the
+two cannot be committed together as one atomic unit without a more
+advanced pattern (e.g. a transactional outbox), which is out of scope
+for this project's size.
 
 Consequently, `handle_command` deliberately does the agent's work
-(including publishing every event) BEFORE opening the database
-transaction that records the message as processed, and that record is
-written as the LAST step, immediately before ack. This ordering
-shrinks - but does not eliminate - the risk window: if the worker
-crashes after events are published but before the idempotency row
-commits, a redelivery will run the agent again and publish the events
-a second time, even though nothing is wrong from the database's point
-of view. This is called out explicitly (not hidden) in the README as a
-known limitation of this project's scope, together with why closing it
-fully is not attempted here.
+(including publishing every event AND running every tool, as of commit
+2) BEFORE opening the database transaction that records the message as
+processed, and that record is written as the LAST step, immediately
+before ack. This ordering shrinks - but does not eliminate - the risk
+window: if the worker crashes after events/tool-effects happen but
+before the idempotency row commits, a redelivery will run the agent
+again (including its tools) and publish the events a second time, even
+though nothing is wrong from the database's point of view. This is
+called out explicitly (not hidden) in the README as a known limitation
+of this project's scope, together with why closing it fully is not
+attempted here.
 """
 
 import json
@@ -94,17 +109,17 @@ import traceback
 
 import pika
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from db import (
     DuplicateMessageError,
     already_processed,
     fetch_conversation_history,
     mark_processed,
-    save_assistant_message,
+    save_assistant_message_with_tool_calls,
 )
 from envelope import Envelope, MessageType
 from events import publish_event
+from graph.agent_graph import AGENT_RECURSION_LIMIT, build_agent_graph, build_initial_messages
 from llm.factory import get_default_chat_model
 from topology import DLQ_QUEUE, COMMAND_QUEUE, declare_topology, retry_queue_for_attempt
 
@@ -123,19 +138,11 @@ RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
 # per reply small without pulling in a tokenizer just for this.
 DELTA_BUFFER_CHARS = 40
 
-SUPPORT_SYSTEM_PROMPT = (
-    "You are Maya, a customer support assistant for an online store. "
-    "Answer the customer's question clearly and concisely, in the same "
-    "language they wrote in, based on the conversation so far. You do "
-    "not yet have access to the order database, company documents, or "
-    "the web - if answering well would require looking one of those "
-    "up, say so plainly instead of guessing; that capability is added "
-    "in a later step of this project."
-)
-
 # Built lazily, once per worker process - constructing a LangChain chat
 # model only wires up an HTTP client, it makes no network call itself,
-# so there is no reason to rebuild it on every command.
+# so there is no reason to rebuild it on every command. The GRAPH,
+# unlike the model, is rebuilt per command (see build_agent_graph's
+# docstring) because it is scoped to one acting_user_id.
 _chat_model = None
 
 
@@ -146,44 +153,7 @@ def _get_chat_model():
     return _chat_model
 
 
-def _history_to_messages(history: list[dict]) -> list:
-    """Converts the plain dict rows from db.fetch_conversation_history
-    into LangChain message objects, prefixed with the system prompt."""
-    messages = [SystemMessage(content=SUPPORT_SYSTEM_PROMPT)]
-    for entry in history:
-        if entry["role"] == "user":
-            messages.append(HumanMessage(content=entry["content"]))
-        else:
-            messages.append(AIMessage(content=entry["content"]))
-    return messages
-
-
-def _stream_reply_as_buffered_deltas(channel, model, messages, correlation_id: str) -> str:
-    """
-    Streams the model's reply token-by-token internally, but only
-    publishes an AGENT_RESPONSE_CHUNK event once roughly
-    DELTA_BUFFER_CHARS characters have accumulated (plus one final
-    flush for whatever remains) - the buffering the project brief
-    requires. Returns the full, unbuffered reply text for persistence.
-    """
-    full_text_parts = []
-    buffer = ""
-
-    for chunk in model.stream(messages):
-        piece = chunk.content or ""
-        if not piece:
-            continue
-        full_text_parts.append(piece)
-        buffer += piece
-        if len(buffer) >= DELTA_BUFFER_CHARS:
-            publish_event(
-                channel,
-                MessageType.AGENT_RESPONSE_CHUNK,
-                payload={"delta": buffer},
-                correlation_id=correlation_id,
-            )
-            buffer = ""
-
+def _publish_buffered_delta(channel, buffer: str, correlation_id: str) -> None:
     if buffer:
         publish_event(
             channel,
@@ -192,16 +162,19 @@ def _stream_reply_as_buffered_deltas(channel, model, messages, correlation_id: s
             correlation_id=correlation_id,
         )
 
-    return "".join(full_text_parts)
-
 
 def run_agent(channel, envelope: Envelope) -> None:
     """
-    Generate and publish a reply for one PROCESS_USER_MESSAGE command.
+    Generate and publish a reply for one PROCESS_USER_MESSAGE command,
+    now by running the real LangGraph agent instead of a single
+    tool-less LLM call.
 
     Steps: publish AGENT_RUN_STARTED -> load conversation history from
-    the database -> call the LLM (streamed, buffered deltas) -> persist
-    the final text as a Message row -> publish AGENT_RUN_COMPLETED.
+    the database -> build this run's agent graph (tools bound to this
+    command's acting_user_id) -> stream the graph, publishing buffered
+    text deltas AND real tool-call events as they occur -> persist the
+    final text (with its tool-call trace) as a Message row -> publish
+    AGENT_RUN_COMPLETED.
 
     Raises to simulate a failure so the retry/backoff/DLQ path is
     exercisable: set payload["text"] to the literal string
@@ -209,12 +182,13 @@ def run_agent(channel, envelope: Envelope) -> None:
     """
     correlation_id = envelope.correlation_id
     conversation_id = envelope.payload.get("conversation_id")
+    acting_user_id = envelope.payload.get("acting_user_id")
     user_text = envelope.payload.get("text", "")
 
     publish_event(
         channel,
         MessageType.AGENT_RUN_STARTED,
-        payload={"acting_user_id": envelope.payload.get("acting_user_id")},
+        payload={"acting_user_id": acting_user_id},
         correlation_id=correlation_id,
     )
 
@@ -225,21 +199,126 @@ def run_agent(channel, envelope: Envelope) -> None:
 
     # The user's own message was already persisted by Django
     # (support/views.py) BEFORE this command was published, so it is
-    # already the last row returned here - it must not be appended a
-    # second time.
+    # already the last row returned here if the read-after-write is
+    # visible; build_initial_messages tolerates either case (see its
+    # own docstring) so this history is never duplicated in the prompt.
     history = fetch_conversation_history(conversation_id) if conversation_id else []
-    messages = _history_to_messages(history)
+    messages = build_initial_messages(history, user_text)
 
     model = _get_chat_model()
-    reply_text = _stream_reply_as_buffered_deltas(channel, model, messages, correlation_id)
+    graph = build_agent_graph(model, acting_user_id)
+
+    # A fresh thread_id per command: this graph's checkpointer
+    # (MemorySaver, see agent_graph.py's docstring) only needs to
+    # track state for THIS invocation, so there is no reason to reuse
+    # thread ids across commands or conversations.
+    graph_config = {
+        "configurable": {"thread_id": envelope.message_id},
+        "recursion_limit": AGENT_RECURSION_LIMIT,
+    }
+
+    reply_text_parts: list[str] = []
+    delta_buffer = ""
+    tool_calls_trace: list[dict] = []
+    # Tracks which AIMessage tool_call ids we've already announced via
+    # AGENT_TOOL_CALLED (with args, before the result exists) so each
+    # call is announced exactly once.
+    announced_tool_call_ids: set[str] = set()
+    # Tracks which ToolMessages (by tool_call_id) we've already folded
+    # into tool_calls_trace, for the same "seen once" reason.
+    recorded_tool_result_ids: set[str] = set()
+
+    # stream_mode=["messages", "updates"] gives us BOTH true per-token
+    # deltas from inside agent_node's chat-model call ("messages": a
+    # (chunk, metadata) pair per token, the real "پخش زنده" the brief
+    # asks for in section 6) AND node-level completion events
+    # ("updates": the full state update once a node finishes, which is
+    # where a finished AIMessage's tool_calls or a ToolMessage's result
+    # become visible). Using token-level streaming here - rather than
+    # commit 1's coarser "wait for the whole message" approach - is
+    # what makes AGENT_RESPONSE_CHUNK events genuine incremental
+    # deltas instead of one big flush at the end.
+    for stream_kind, chunk in graph.stream(
+        {"messages": messages},
+        config=graph_config,
+        stream_mode=["messages", "updates"],
+    ):
+        if stream_kind == "messages":
+            message_chunk, _metadata = chunk
+            # Only agent_node's own token stream has real text content
+            # to relay; ToolMessage chunks (tool node) carry step
+            # results, not narration, and are handled via "updates"
+            # below instead.
+            if getattr(message_chunk, "type", None) == "ai":
+                piece = message_chunk.content or ""
+                if piece:
+                    reply_text_parts.append(piece)
+                    delta_buffer += piece
+                    if len(delta_buffer) >= DELTA_BUFFER_CHARS:
+                        _publish_buffered_delta(channel, delta_buffer, correlation_id)
+                        delta_buffer = ""
+            continue
+
+        # stream_kind == "updates": one dict per node that just
+        # finished, e.g. {"agent": {"messages": [AIMessage(...)]}} or
+        # {"tools": {"messages": [ToolMessage(...), ...]}}.
+        for node_output in chunk.values():
+            for message in node_output.get("messages", []):
+                tool_calls = getattr(message, "tool_calls", None) or []
+                for call in tool_calls:
+                    call_id = call.get("id")
+                    if not call_id or call_id in announced_tool_call_ids:
+                        continue
+                    announced_tool_call_ids.add(call_id)
+                    publish_event(
+                        channel,
+                        MessageType.AGENT_TOOL_CALLED,
+                        payload={
+                            "tool_call_id": call_id,
+                            "tool_name": call.get("name"),
+                            "tool_args": call.get("args"),
+                            "phase": "started",
+                        },
+                        correlation_id=correlation_id,
+                    )
+
+                tool_call_id = getattr(message, "tool_call_id", None)
+                if tool_call_id and tool_call_id not in recorded_tool_result_ids:
+                    recorded_tool_result_ids.add(tool_call_id)
+                    result_content = message.content
+                    publish_event(
+                        channel,
+                        MessageType.AGENT_TOOL_CALLED,
+                        payload={
+                            "tool_call_id": tool_call_id,
+                            "tool_name": getattr(message, "name", None),
+                            "result": result_content,
+                            "phase": "completed",
+                        },
+                        correlation_id=correlation_id,
+                    )
+                    tool_calls_trace.append(
+                        {
+                            "tool_call_id": tool_call_id,
+                            "tool_name": getattr(message, "name", None),
+                            "result": result_content,
+                        }
+                    )
+
+    _publish_buffered_delta(channel, delta_buffer, correlation_id)
+    reply_text = "".join(reply_text_parts)
 
     if conversation_id:
-        save_assistant_message(conversation_id, reply_text)
+        save_assistant_message_with_tool_calls(
+            conversation_id,
+            reply_text,
+            json.dumps(tool_calls_trace, ensure_ascii=False) if tool_calls_trace else None,
+        )
 
     publish_event(
         channel,
         MessageType.AGENT_RUN_COMPLETED,
-        payload={"final_text": reply_text},
+        payload={"final_text": reply_text, "tool_calls": tool_calls_trace},
         correlation_id=correlation_id,
     )
 
@@ -355,14 +434,15 @@ def handle_command(channel, method, properties, body):
 
     try:
         # Run the agent's actual work (including publishing every
-        # event) FIRST, and only record "this message_id is done" as
-        # the LAST step, right before ack. See this file's module
-        # docstring ("Known limitation") for why this order - agent
-        # work, then the idempotency write - is the deliberate choice:
-        # RabbitMQ and PostgreSQL are two separate systems that cannot
-        # be committed together, so the idempotency row can only ever
-        # protect what happens AFTER it is written. Writing it last
-        # minimizes that gap; it does not eliminate it.
+        # event and executing every tool call) FIRST, and only record
+        # "this message_id is done" as the LAST step, right before
+        # ack. See this file's module docstring ("Known limitation")
+        # for why this order - agent work, then the idempotency write
+        # - is the deliberate choice: RabbitMQ and PostgreSQL are two
+        # separate systems that cannot be committed together, so the
+        # idempotency row can only ever protect what happens AFTER it
+        # is written. Writing it last minimizes that gap; it does not
+        # eliminate it.
         run_agent(channel, envelope)
 
         mark_processed(
