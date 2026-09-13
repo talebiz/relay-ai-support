@@ -5,11 +5,20 @@ pika==1.3.2                    # RabbitMQ consumer/publisher
 langgraph==0.2.62
 langchain-core==0.3.28
 
+# --- LLM provider integrations (part 4: llm/factory.py) ---
+# "openai_compatible" covers most free-tier providers (Groq, OpenRouter,
+# local Ollama, etc.) since they expose an OpenAI-shaped chat completion
+# API - langchain-openai pointed at a custom base_url is enough for all
+# of them, no separate package per provider needed for that case.
+langchain-openai==0.2.14
+langchain-anthropic==0.3.1
+langchain-google-genai==2.0.7
+
 # --- Vector store client (for the retrieval tool) ---
 chromadb==0.5.23
 
 # --- Database access (worker needs to read/write via the same schema,
-#     for the idempotency table - see db.py) ---
+#     for idempotency and conversation history - see db.py) ---
 psycopg[binary]==3.2.3
 
 # --- Observability ---

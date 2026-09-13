@@ -20,6 +20,8 @@ urlpatterns = [
     path("api/auth/me/", MeView.as_view(), name="me"),
     # --- Domain ---
     path("api/", include("orders.urls")),
+    # --- Part 4: conversation/message persistence ---
+    path("api/", include("conversations.urls")),
     # --- Part 3: event-driven pipeline ---
     # support: HTTP entry point that publishes a command to RabbitMQ.
     # streaming: SSE view that relays RabbitMQ events back to the browser.

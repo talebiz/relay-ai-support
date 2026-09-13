@@ -15,13 +15,20 @@ What this file implements (project brief, section 3):
         with exponential backoff via staged retry queues, and
         idempotency enforced in the database (db.py).
 
-What this file does NOT yet implement: the actual LangGraph agent,
-tools, RAG, and Langfuse tracing - those are later parts of the
-project brief (sections 4, 5, 7). `run_agent_placeholder` below is
-where that real work will be plugged in; everything around it
-(idempotency, ack/nack, retry, DLQ, event publishing) is already the
-real, final implementation and will not need to change when the real
-agent is added.
+Part 4, commit 1 update: `run_agent_placeholder`'s echo has been
+replaced by `run_agent`, which makes a REAL (but still tool-less,
+single LLM call) reply: it loads the conversation's history from the
+database (db.fetch_conversation_history), calls the configured LLM via
+llm/factory.py (with automatic provider fallback), streams the reply
+back as buffered delta events, and persists the final text
+(db.save_assistant_message) as the system of record. What it still
+does NOT do: call any tool (database lookup, RAG, web search, refund
+action) or run inside a LangGraph loop - the model can only rely on
+conversation history, not look anything up. That is part 4 commit 2,
+once the graph and its four tools exist. Everything AROUND the agent
+call (idempotency, ack/nack, retry, DLQ, event publishing) is
+unchanged from part 3 and will not need to change again when the real
+graph is added in commit 2 - only `run_agent`'s body will.
 
 --- The two required answers (project brief, section 3(b)) ---
 
@@ -62,9 +69,9 @@ A2: RabbitMQ only removes a message from the queue when it receives an
 The idempotency guarantee above (Q1) is enforced by a PostgreSQL UNIQUE
 constraint, which only protects work that is still inside the open
 database transaction when a crash happens. Publishing an event to
-RabbitMQ (`publish_event`, called from `run_agent_placeholder`) is a
-SEPARATE system from PostgreSQL - the two cannot be committed together
-as one atomic unit without a more advanced pattern (e.g. a transactional
+RabbitMQ (`publish_event`, called from `run_agent`) is a SEPARATE
+system from PostgreSQL - the two cannot be committed together as one
+atomic unit without a more advanced pattern (e.g. a transactional
 outbox), which is out of scope for this project's size.
 
 Consequently, `handle_command` deliberately does the agent's work
@@ -87,10 +94,18 @@ import traceback
 
 import pika
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from db import DuplicateMessageError, already_processed, mark_processed
+from db import (
+    DuplicateMessageError,
+    already_processed,
+    fetch_conversation_history,
+    mark_processed,
+    save_assistant_message,
+)
 from envelope import Envelope, MessageType
 from events import publish_event
+from llm.factory import get_default_chat_model
 from topology import DLQ_QUEUE, COMMAND_QUEUE, declare_topology, retry_queue_for_attempt
 
 load_dotenv()
@@ -99,6 +114,134 @@ RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+
+# How many characters to accumulate before publishing one
+# AGENT_RESPONSE_CHUNK event, instead of one event per token (project
+# brief section 6: "رویدادهای تدریجی را بافر کنید؛ به ازای هر token یک
+# پیام روی صف نفرستید"). A plain character count, not a token count -
+# simple, and good enough to keep the number of RabbitMQ/SSE messages
+# per reply small without pulling in a tokenizer just for this.
+DELTA_BUFFER_CHARS = 40
+
+SUPPORT_SYSTEM_PROMPT = (
+    "You are Maya, a customer support assistant for an online store. "
+    "Answer the customer's question clearly and concisely, in the same "
+    "language they wrote in, based on the conversation so far. You do "
+    "not yet have access to the order database, company documents, or "
+    "the web - if answering well would require looking one of those "
+    "up, say so plainly instead of guessing; that capability is added "
+    "in a later step of this project."
+)
+
+# Built lazily, once per worker process - constructing a LangChain chat
+# model only wires up an HTTP client, it makes no network call itself,
+# so there is no reason to rebuild it on every command.
+_chat_model = None
+
+
+def _get_chat_model():
+    global _chat_model
+    if _chat_model is None:
+        _chat_model = get_default_chat_model()
+    return _chat_model
+
+
+def _history_to_messages(history: list[dict]) -> list:
+    """Converts the plain dict rows from db.fetch_conversation_history
+    into LangChain message objects, prefixed with the system prompt."""
+    messages = [SystemMessage(content=SUPPORT_SYSTEM_PROMPT)]
+    for entry in history:
+        if entry["role"] == "user":
+            messages.append(HumanMessage(content=entry["content"]))
+        else:
+            messages.append(AIMessage(content=entry["content"]))
+    return messages
+
+
+def _stream_reply_as_buffered_deltas(channel, model, messages, correlation_id: str) -> str:
+    """
+    Streams the model's reply token-by-token internally, but only
+    publishes an AGENT_RESPONSE_CHUNK event once roughly
+    DELTA_BUFFER_CHARS characters have accumulated (plus one final
+    flush for whatever remains) - the buffering the project brief
+    requires. Returns the full, unbuffered reply text for persistence.
+    """
+    full_text_parts = []
+    buffer = ""
+
+    for chunk in model.stream(messages):
+        piece = chunk.content or ""
+        if not piece:
+            continue
+        full_text_parts.append(piece)
+        buffer += piece
+        if len(buffer) >= DELTA_BUFFER_CHARS:
+            publish_event(
+                channel,
+                MessageType.AGENT_RESPONSE_CHUNK,
+                payload={"delta": buffer},
+                correlation_id=correlation_id,
+            )
+            buffer = ""
+
+    if buffer:
+        publish_event(
+            channel,
+            MessageType.AGENT_RESPONSE_CHUNK,
+            payload={"delta": buffer},
+            correlation_id=correlation_id,
+        )
+
+    return "".join(full_text_parts)
+
+
+def run_agent(channel, envelope: Envelope) -> None:
+    """
+    Generate and publish a reply for one PROCESS_USER_MESSAGE command.
+
+    Steps: publish AGENT_RUN_STARTED -> load conversation history from
+    the database -> call the LLM (streamed, buffered deltas) -> persist
+    the final text as a Message row -> publish AGENT_RUN_COMPLETED.
+
+    Raises to simulate a failure so the retry/backoff/DLQ path is
+    exercisable: set payload["text"] to the literal string
+    "__simulate_failure__" when testing that path manually.
+    """
+    correlation_id = envelope.correlation_id
+    conversation_id = envelope.payload.get("conversation_id")
+    user_text = envelope.payload.get("text", "")
+
+    publish_event(
+        channel,
+        MessageType.AGENT_RUN_STARTED,
+        payload={"acting_user_id": envelope.payload.get("acting_user_id")},
+        correlation_id=correlation_id,
+    )
+
+    if user_text == "__simulate_failure__":
+        # Deliberate failure path for demonstrating retry/backoff/DLQ
+        # during the defense, without needing a real agent bug.
+        raise RuntimeError("Simulated failure for retry/DLQ demonstration")
+
+    # The user's own message was already persisted by Django
+    # (support/views.py) BEFORE this command was published, so it is
+    # already the last row returned here - it must not be appended a
+    # second time.
+    history = fetch_conversation_history(conversation_id) if conversation_id else []
+    messages = _history_to_messages(history)
+
+    model = _get_chat_model()
+    reply_text = _stream_reply_as_buffered_deltas(channel, model, messages, correlation_id)
+
+    if conversation_id:
+        save_assistant_message(conversation_id, reply_text)
+
+    publish_event(
+        channel,
+        MessageType.AGENT_RUN_COMPLETED,
+        payload={"final_text": reply_text},
+        correlation_id=correlation_id,
+    )
 
 
 def connect_with_retry(max_attempts: int = 10, delay_seconds: float = 3.0) -> pika.BlockingConnection:
@@ -126,48 +269,6 @@ def connect_with_retry(max_attempts: int = 10, delay_seconds: float = 3.0) -> pi
             time.sleep(delay_seconds)
 
     raise RuntimeError("Could not connect to RabbitMQ after multiple attempts")
-
-
-def run_agent_placeholder(channel, envelope: Envelope) -> None:
-    """
-    Stand-in for the real LangGraph agent (project brief section 4),
-    added in a later step. Publishes a minimal, plausible sequence of
-    events so the RabbitMQ -> SSE -> React pipeline is demonstrable
-    end-to-end even before the real agent exists.
-
-    Raises to simulate a failure so the retry/backoff/DLQ path is
-    exercisable: set payload["text"] to the literal string
-    "__simulate_failure__" when testing that path manually.
-    """
-    correlation_id = envelope.correlation_id
-    user_text = envelope.payload.get("text", "")
-
-    publish_event(
-        channel,
-        MessageType.AGENT_RUN_STARTED,
-        payload={"acting_user_id": envelope.payload.get("acting_user_id")},
-        correlation_id=correlation_id,
-    )
-
-    if user_text == "__simulate_failure__":
-        # Deliberate failure path for demonstrating retry/backoff/DLQ
-        # during the defense, without needing a real agent bug.
-        raise RuntimeError("Simulated failure for retry/DLQ demonstration")
-
-    reply_text = f'Echo (placeholder agent): "{user_text}"'
-    publish_event(
-        channel,
-        MessageType.AGENT_RESPONSE_CHUNK,
-        payload={"delta": reply_text},
-        correlation_id=correlation_id,
-    )
-
-    publish_event(
-        channel,
-        MessageType.AGENT_RUN_COMPLETED,
-        payload={"final_text": reply_text},
-        correlation_id=correlation_id,
-    )
 
 
 def _route_to_retry_or_dlq(channel, envelope: Envelope, error: Exception) -> None:
@@ -262,7 +363,7 @@ def handle_command(channel, method, properties, body):
         # be committed together, so the idempotency row can only ever
         # protect what happens AFTER it is written. Writing it last
         # minimizes that gap; it does not eliminate it.
-        run_agent_placeholder(channel, envelope)
+        run_agent(channel, envelope)
 
         mark_processed(
             message_id=envelope.message_id,

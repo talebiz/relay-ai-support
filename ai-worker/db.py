@@ -6,19 +6,13 @@ load Django's ORM or settings. It connects to the SAME PostgreSQL
 database Django uses (shared resource, per project brief section 3
 intro: "RabbitMQ scope is narrow - only the backend<->AI-worker bridge;
 PostgreSQL and ChromaDB are shared resources accessed directly by
-multiple services") using plain psycopg, against the `messaging_processedmessage`
-table that Django's migration (backend/messaging/migrations/0001_initial.py)
-created.
+multiple services") using plain psycopg.
 
-This is the database-enforced half of idempotency described in that
-same migration's model docstring (backend/messaging/models.py):
-whichever process INSERTs a message_id first "wins"; a second attempt
-to insert the same message_id hits the UNIQUE constraint and is
-recognized as already-handled.
+Two groups of functions live here:
 
-Two functions are exposed, used in two different moments by
-worker.py::handle_command (see that module's docstring, "Known
-limitation" section, for the full reasoning):
+  Idempotency (project brief 3(b), against the
+  `messaging_processedmessage` table Django's migration
+  (backend/messaging/migrations/0001_initial.py) created):
 
     already_processed(message_id)  - a cheap, early, READ-ONLY check,
         called BEFORE doing any agent work. Lets a redelivered message
@@ -27,18 +21,32 @@ limitation" section, for the full reasoning):
 
     mark_processed(message_id, ...) - the actual INSERT that claims
         this message_id, called AFTER the agent work is done, as the
-        very last step before ack. This is what makes the guarantee
-        real (a UNIQUE constraint, not just the early check, which by
-        itself would still have a race window between two concurrent
-        deliveries).
+        very last step before ack. See worker.py's module docstring
+        ("Known limitation") for the honest limit this leaves.
 
-Neither function on its own is a complete guarantee - see the module
-docstring in worker.py for the honest limitation this leaves.
+  Conversation history (part 4, against the `conversations_message`
+  table Django's migration (backend/conversations/migrations/0001_initial.py)
+  created) - the worker's read/write access to the system of record for
+  chat messages, described in streaming/views.py's docstring:
+
+    fetch_conversation_history(conversation_id) - read the messages
+        recorded so far for one conversation, oldest first, to build
+        the prompt for the LLM.
+
+    save_assistant_message(conversation_id, content) - persist the
+        assistant's finished reply. This, not the RabbitMQ event
+        stream, is what makes a reply durable and re-fetchable after
+        an SSE reconnect.
+
+Neither idempotency function on its own is a complete guarantee - see
+the module docstring in worker.py for the honest limitation this
+leaves.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from contextlib import contextmanager
 
 import psycopg
@@ -134,3 +142,56 @@ def mark_processed(message_id: str, correlation_id: str, message_type: str) -> N
             )
     except psycopg.errors.UniqueViolation as exc:
         raise DuplicateMessageError(message_id) from exc
+
+
+def fetch_conversation_history(conversation_id: str, limit: int = 20) -> list[dict]:
+    """
+    Reads up to the last `limit` messages (oldest first) for one
+    conversation directly from the `conversations_message` table
+    Django's migration created. Plain SQL, not the ORM, for the same
+    reason as the idempotency functions above: this process is not a
+    Django app.
+
+    `limit` bounds the prompt size sent to the LLM - a long-running
+    conversation should not silently grow the request (and the bill)
+    without limit. 20 turns is a simple, generous-enough default for
+    this project's scale; a production system would summarize older
+    history instead of just truncating it.
+    """
+    with transaction() as cursor:
+        cursor.execute(
+            """
+            SELECT role, content
+            FROM conversations_message
+            WHERE conversation_id = %s
+            ORDER BY created_at ASC
+            LIMIT %s
+            """,
+            (conversation_id, limit),
+        )
+        rows = cursor.fetchall()
+    return [{"role": role, "content": content} for role, content in rows]
+
+
+def save_assistant_message(conversation_id: str, content: str) -> str:
+    """
+    Persists the assistant's finished reply as the system of record
+    (project brief section 6: the database, not the SSE stream, is
+    the source of truth for "what did the assistant actually say").
+    Returns the new message's id.
+
+    `tool_calls_json` is left NULL here - part 4 commit 1 has no real
+    tools yet. Commit 2 will pass the tool-call trace through once the
+    LangGraph agent exists.
+    """
+    message_id = str(uuid.uuid4())
+    with transaction() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO conversations_message
+                (id, conversation_id, role, content, tool_calls_json, created_at)
+            VALUES (%s, %s, %s, %s, NULL, now())
+            """,
+            (message_id, conversation_id, "assistant", content),
+        )
+    return message_id

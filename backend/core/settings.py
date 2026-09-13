@@ -52,6 +52,10 @@ INSTALLED_APPS = [
     "health",
     "accounts",
     "orders",
+    # Part 4: conversation/message persistence - the system of record
+    # for the chat (see conversations/models.py docstring for why this
+    # is a separate app rather than folded into orders or support).
+    "conversations",
     # Part 3: event-driven architecture (RabbitMQ). See each app's
     # docstrings for what it owns:
     #   - messaging:  shared envelope, topology, publisher, idempotency model
@@ -168,6 +172,12 @@ REST_FRAMEWORK = {
 # itself - Django is the only component that authenticates a user; the
 # worker only ever receives an already-resolved user id inside a
 # command message (see messaging/envelope.py, part 3).
+#
+# Part 4 adds one more consumer of these tokens: streaming/views.py
+# validates an access token passed as a query parameter (?token=...)
+# before opening an SSE connection, since EventSource cannot send a
+# custom Authorization header. It reuses this exact same JWT config -
+# no separate "streaming token" scheme was introduced.
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),

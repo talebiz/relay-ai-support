@@ -36,8 +36,8 @@ conversation it is currently viewing, not everyone's traffic. The
 exchange is fanout (every subscriber receives every event - that's
 what "an event may have zero or more consumers" means at the transport
 level), so filtering by correlation_id happens IN THIS VIEW rather than
-in RabbitMQ's routing: sqlite-simple, and correct at this project's
-scale. A busier deployment might switch to a topic exchange keyed by
+in RabbitMQ's routing: simple, and correct at this project's scale. A
+busier deployment might switch to a topic exchange keyed by
 correlation_id to avoid delivering irrelevant events into every open
 connection at all, but the brief scores the design decision, not
 throughput, so this tradeoff is stated rather than hidden.
@@ -48,14 +48,30 @@ NO memory of what happened before the connection opened. If a browser
 tab disconnects mid-stream and reconnects, it will only see events
 published AFTER the reconnect; it will not replay anything it missed.
 The source of truth for "what did the assistant actually say" is the
-database, written by the AI worker as it processes the command - NOT
-the SSE stream itself. The frontend's job on reconnect is to re-fetch
-the conversation's current state from a regular REST endpoint (backed
+database (conversations.Message, part 4), written by the AI worker as
+it processes the command - NOT the SSE stream itself. The frontend's
+job on reconnect is to re-fetch the conversation's current state from
+GET /api/conversations/<id>/messages/ (a regular REST endpoint backed
 by the DB) to resync, and then resume listening to the live stream for
 anything new. This is why the connection-state values called out in
 the brief (connected / disconnected / reconnecting / failed) matter:
 the UI must show the user when it might be looking at stale state
 versus a live one, rather than silently going quiet.
+
+--- Part 4: authorization before opening the stream ---
+
+Part 3 left this as an explicit TODO: confirm the requesting user
+actually owns the conversation behind a given correlation_id before
+handing them a live feed of it. That is now enforced here, using the
+same conversations/services.py chokepoint every other endpoint in this
+project uses - never a bespoke check written only for this view.
+
+EventSource (the browser API behind SSE) cannot attach a custom
+Authorization header, so the JWT access token travels as a query
+parameter instead: `GET .../stream/<correlation_id>/?token=<jwt>`.
+This is the one and only place in the codebase that accepts a JWT from
+a query string rather than a header - deliberately narrow, rather than
+relaxing JWTAuthentication globally for every endpoint.
 """
 
 from __future__ import annotations
@@ -65,8 +81,13 @@ import json
 import os
 
 import aio_pika
-from django.http import StreamingHttpResponse
+from asgiref.sync import sync_to_async
+from django.core.exceptions import ObjectDoesNotExist
+from django.http import JsonResponse, StreamingHttpResponse
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
+from conversations import services as conversation_services
 from messaging.topology import EVENTS_EXCHANGE
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
@@ -83,6 +104,40 @@ HEARTBEAT_SECONDS = 15
 def _sse_format(event_dict: dict) -> bytes:
     """Format one event as a standard `data: <json>\n\n` SSE frame."""
     return f"data: {json.dumps(event_dict)}\n\n".encode("utf-8")
+
+
+@sync_to_async
+def _authenticate_from_token(token: str):
+    """
+    Resolve a Django user from a raw JWT access token string, the same
+    class of token issued by TokenObtainPairView and normally carried
+    in an `Authorization: Bearer <token>` header. Returns None (rather
+    than raising) on any validation failure - invalid, expired, or
+    malformed - so the caller can respond with a plain 401.
+    """
+    try:
+        validated = JWTAuthentication().get_validated_token(token)
+        return JWTAuthentication().get_user(validated)
+    except (InvalidToken, TokenError):
+        return None
+
+
+@sync_to_async
+def _authorize_conversation(user, correlation_id: str):
+    """
+    Confirms `user` may see the conversation behind this
+    correlation_id, via the exact same authorization function the REST
+    endpoints use (conversations.services). Returns None if the
+    conversation does not exist OR is not visible to this user -
+    deliberately indistinguishable, same "404 not 403" contract as the
+    rest of the app.
+    """
+    try:
+        return conversation_services.get_conversation_for_user_by_correlation_id(
+            user, correlation_id
+        )
+    except ObjectDoesNotExist:
+        return None
 
 
 async def _event_stream(correlation_id: str):
@@ -155,19 +210,31 @@ async def _event_stream(correlation_id: str):
             pass
 
 
-async def conversation_stream(request, correlation_id: str):
+async def conversation_stream(request, correlation_id):
     """
-    GET /api/stream/<uuid:correlation_id>/
+    GET /api/stream/<uuid:correlation_id>/?token=<jwt access token>
 
-    NOTE: authentication/ownership check for `correlation_id` is not
-    yet wired here - by the time this view is filled in end-to-end, it
-    must confirm request.user actually owns the conversation this
-    correlation_id belongs to (same "authorization in code" principle
-    as orders/services.py), not just trust whatever id the URL
-    contains. Left as an explicit TODO rather than silently skipped.
+    Authorization happens BEFORE the SSE connection is ever opened:
+    resolve the user from the query-param token, then confirm they own
+    the conversation with this correlation_id (or are a support
+    agent). Unauthorized or unauthenticated requests get a normal
+    401/404 JSON response, never a stream - so a client can tell "you
+    are not allowed to see this" apart from "the connection dropped".
     """
+    token = request.GET.get("token")
+    if not token:
+        return JsonResponse({"detail": "Authentication token required."}, status=401)
+
+    user = await _authenticate_from_token(token)
+    if user is None:
+        return JsonResponse({"detail": "Invalid or expired token."}, status=401)
+
+    conversation = await _authorize_conversation(user, str(correlation_id))
+    if conversation is None:
+        return JsonResponse({"detail": "Conversation not found."}, status=404)
+
     response = StreamingHttpResponse(
-        _event_stream(correlation_id),
+        _event_stream(str(correlation_id)),
         content_type="text/event-stream",
     )
     response["Cache-Control"] = "no-cache"
