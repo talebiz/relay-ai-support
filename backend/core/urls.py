@@ -29,6 +29,7 @@ urlpatterns = [
     # streaming: SSE view that relays RabbitMQ events back to the browser.
     path("api/", include("support.urls")),
     path("api/", include("streaming.urls")),
+    path("api/", include("documents.urls")),
 ]
 
 

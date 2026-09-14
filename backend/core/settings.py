@@ -66,6 +66,7 @@ INSTALLED_APPS = [
     "messaging",
     "support",
     "streaming",
+    "documents",
 ]
 
 # Custom user model. See accounts/models.py for why this exists even

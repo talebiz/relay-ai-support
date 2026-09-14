@@ -17,9 +17,10 @@ function formatPrice(cents: number): string {
 
 interface OrdersPageProps {
   onSelectOrder: (orderId: string) => void;
+  onGoToDocuments: () => void;
 }
 
-export default function OrdersPage({ onSelectOrder }: OrdersPageProps) {
+export default function OrdersPage({ onSelectOrder, onGoToDocuments }: OrdersPageProps) {
   const { user, logout } = useAuth();
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -45,9 +46,14 @@ export default function OrdersPage({ onSelectOrder }: OrdersPageProps) {
             </p>
           )}
         </div>
-        <button className="secondary" onClick={logout}>
-          خروج
-        </button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button className="secondary" onClick={onGoToDocuments}>
+            اسناد
+          </button>
+          <button className="secondary" onClick={logout}>
+            خروج
+          </button>
+        </div>
       </header>
 
       {error && <p className="form-error">{error}</p>}

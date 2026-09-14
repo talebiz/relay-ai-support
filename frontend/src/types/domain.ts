@@ -139,3 +139,17 @@ export type AgentEvent =
       payload: { final_text: string; tool_calls: ToolCallRecord[] };
     }
   | { type: "event.agent_run_failed"; correlation_id: string; payload: { reason: string; retry_count: number } };
+
+
+export type DocumentStatus = "pending" | "indexed" | "failed";
+
+export interface DocumentInfo {
+  id: string;
+  title: string;
+  original_filename: string;
+  uploaded_by_username: string | null;
+  status: DocumentStatus;
+  chunk_count: number;
+  error_message: string;
+  created_at: string;
+}

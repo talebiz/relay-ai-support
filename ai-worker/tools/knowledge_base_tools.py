@@ -1,48 +1,37 @@
 """
 Tool 2 of 4: unstructured, internal data - company documents via retrieval.
 
-Project brief, section 4 ("سه نوع دانش"): "داده غیرساختاریافته داخلی:
-اسناد بارگذاری شده، از طریق بازیابی. «سیاست بازگشت کالا چیست؟»" -
-unstructured internal data (uploaded documents), via retrieval. "What
-is the return policy?"
+Part 5 update: this tool now queries a ChromaDB collection that is
+populated by Django's document ingestion pipeline
+(backend/documents/services.py) rather than seeding its own hard-coded
+placeholder documents. The tool itself is SIMPLER than in Part 4 -
+it no longer needs to seed anything, because the ingestion pipeline
+(and the seed_documents management command) handle that separately.
 
-Scope of this commit vs. Part 5
---------------------------------
-The project brief dedicates its OWN section (5) to RAG - "از بارگذاری
-سند تا ابزار بازیابی، با ذخیره‌سازی برداری در ChromaDB. پاسخ باید
-ارجاع به منبع را حفظ کند" (from document ingestion to the retrieval
-tool, with vector storage in ChromaDB; the answer must preserve a
-source reference) - clearly a separate, larger piece of work than "one
-of four tools the graph routes to." So this commit deliberately keeps
-this file MINIMAL:
+What changed from Part 4:
+  - Removed _SEED_DOCUMENTS and the lazy-seed logic from
+    _get_or_create_collection. The collection is now managed entirely
+    by Django's documents app; this tool just reads from it.
+  - Increased n_results from 2 to 3 for slightly better recall.
+  - Each result now carries richer metadata (document_id,
+    document_title, chunk_index) set by the ingestion pipeline,
+    rather than just the "title" the Part 4 placeholder stored.
 
-  - A tiny, hard-coded set of company documents (return policy,
-    shipping policy, warranty policy) is embedded into a ChromaDB
-    collection lazily, once, the first time the worker process needs
-    it - not a real document-ingestion pipeline (chunking strategy,
-    file upload endpoint, re-indexing on change). That is Part 5's job.
-  - The tool itself, however, IS real: it does a genuine embedding
-    similarity search against a genuine persistent ChromaDB collection
-    and returns genuine retrieved passages with a source label - not a
-    hard-coded if/else keyword match. This is what the project brief
-    means by "a graph that already routes correctly among all four
-    tools" being commit 2's job, with the ingestion pipeline itself
-    slotting in later without changing the tool's calling contract.
-  - Every result carries `"source": "internal_document"` plus the
-    originating document's title, so a citation built from this tool's
-    output can never be visually confused with a web citation (project
-    brief 5: "ارجاع به سند داخلی نباید با ارجاع به صفحه وب یکسان به نظر
-    برسد" - an internal-document citation must not look the same as a
-    web-page citation). See web_search_tools.py for the matching
-    "source": "web" marker on the other side of that requirement.
+What did NOT change:
+  - The tool's name, description, and schema
+    (SearchKnowledgeBaseInput) are identical - the agent graph and the
+    system prompt that reference "search_knowledge_base" are untouched.
+  - Every result still carries `"source": "internal_document"` in its
+    metadata, so the frontend can distinguish it from a web citation
+    (project brief 5: "ارجاع به سند داخلی نباید با ارجاع به صفحه وب
+    یکسان به نظر برسد").
 
-Why ChromaDB's HTTP client here, not an embedded/local instance: this
-worker and the (future) Django ingestion endpoint are two separate
-processes that must see the SAME collection - ChromaDB's own server
-mode (already in docker-compose.yml as the `chromadb` service, per
-project brief section 1's required six services) is what makes that
-possible, exactly like PostgreSQL being a shared resource both
-services connect to directly (see this module's sibling, db.py).
+ChromaDB connection: same HttpClient as Part 4, pointing at the same
+`chromadb` service in docker-compose.yml. Both this worker and
+Django's ingestion code connect to the same ChromaDB server and use
+the same collection name ("company_documents") - that is what makes a
+document uploaded through Django immediately searchable here, with no
+synchronization mechanism beyond ChromaDB itself.
 """
 
 from __future__ import annotations
@@ -60,50 +49,6 @@ CHROMADB_PORT = int(os.getenv("CHROMADB_PORT", "8000"))
 
 COLLECTION_NAME = "company_documents"
 
-# Placeholder seed corpus for this commit. Each entry becomes exactly
-# one ChromaDB document (no chunking - these are already short). Part
-# 5 replaces this with a real ingestion pipeline that chunks larger,
-# user-uploaded files; the tool below does not need to change when
-# that happens, only this seed step goes away.
-_SEED_DOCUMENTS = [
-    {
-        "id": "policy-returns",
-        "title": "Return Policy",
-        "text": (
-            "Customers may return most items within 30 days of delivery "
-            "for a full refund, provided the item is unused and in its "
-            "original packaging. Opened electronics (headphones, "
-            "earbuds) can only be returned if defective. Refunds are "
-            "issued to the original payment method within 5-7 business "
-            "days after the returned item is received and inspected."
-        ),
-    },
-    {
-        "id": "policy-shipping",
-        "title": "Shipping Policy",
-        "text": (
-            "Standard shipping takes 3-5 business days within the "
-            "country and is free on orders over $50. Expedited shipping "
-            "(1-2 business days) is available at checkout for an "
-            "additional fee. Once an order ships, a tracking number is "
-            "attached to the order and visible on the order detail page."
-        ),
-    },
-    {
-        "id": "policy-warranty",
-        "title": "Warranty Policy",
-        "text": (
-            "All electronics sold come with a 1-year manufacturer "
-            "warranty covering defects in materials and workmanship. "
-            "The warranty does not cover accidental damage, water "
-            "damage, or normal wear and tear. To file a warranty claim, "
-            "contact support with the order id and a description of the "
-            "defect; approved claims are resolved as a repair, "
-            "replacement, or refund at the company's discretion."
-        ),
-    },
-]
-
 _client: chromadb.HttpClient | None = None
 
 
@@ -114,38 +59,39 @@ def _get_client() -> chromadb.HttpClient:
     return _client
 
 
-def _get_or_create_collection():
+def _get_collection():
     """
-    Fetches the shared collection, seeding it with the placeholder
-    documents above IF (and only if) it is currently empty. Checking
-    `count() == 0` rather than always re-adding by a fixed id set
-    means a real ingestion pipeline (Part 5) can add more documents to
-    this same collection later without this seeding step ever
-    clobbering them.
+    Fetch the shared collection. Unlike Part 4, this no longer seeds
+    anything - the collection is populated by Django's ingestion
+    pipeline (documents/services.py) and the seed_documents management
+    command. If the collection is empty, the tool simply returns
+    "no matching documents found", which is the correct answer.
     """
     client = _get_client()
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
-
-    if collection.count() == 0:
-        collection.add(
-            ids=[doc["id"] for doc in _SEED_DOCUMENTS],
-            documents=[doc["text"] for doc in _SEED_DOCUMENTS],
-            metadatas=[{"title": doc["title"]} for doc in _SEED_DOCUMENTS],
-        )
-
-    return collection
+    return client.get_or_create_collection(name=COLLECTION_NAME)
 
 
 def make_search_knowledge_base_tool() -> StructuredTool:
     """
-    Unlike order_tools/action_tools, this tool needs no per-run
-    identity closure - company documents are not user-scoped, so a
-    single tool instance is safe to reuse across every conversation.
+    Build the search_knowledge_base tool. No per-user identity needed
+    - company documents are shared knowledge, not user-scoped.
     """
 
     def _search_knowledge_base(query: str) -> str:
-        collection = _get_or_create_collection()
-        results = collection.query(query_texts=[query], n_results=2)
+        collection = _get_collection()
+
+        # If the collection is empty, return early with a clear message.
+        if collection.count() == 0:
+            return json.dumps(
+                {
+                    "source": "internal_document",
+                    "matches": [],
+                    "message": "No internal documents have been uploaded yet.",
+                },
+                ensure_ascii=False,
+            )
+
+        results = collection.query(query_texts=[query], n_results=3)
 
         documents = results.get("documents") or [[]]
         metadatas = results.get("metadatas") or [[]]
@@ -155,8 +101,10 @@ def make_search_knowledge_base_tool() -> StructuredTool:
         for text, meta, distance in zip(documents[0], metadatas[0], distances[0]):
             matches.append(
                 {
-                    "source": "internal_document",
-                    "title": meta.get("title", "Untitled document"),
+                    "source": meta.get("source", "internal_document"),
+                    "document_id": meta.get("document_id", "unknown"),
+                    "title": meta.get("document_title", "Untitled document"),
+                    "chunk_index": meta.get("chunk_index", 0),
                     "excerpt": text,
                     "relevance_distance": round(float(distance), 4),
                 }
@@ -164,7 +112,11 @@ def make_search_knowledge_base_tool() -> StructuredTool:
 
         if not matches:
             return json.dumps(
-                {"source": "internal_document", "matches": [], "message": "No matching internal documents found."},
+                {
+                    "source": "internal_document",
+                    "matches": [],
+                    "message": "No matching internal documents found.",
+                },
                 ensure_ascii=False,
             )
 

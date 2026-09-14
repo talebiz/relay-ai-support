@@ -39,6 +39,7 @@ services:
     restart: unless-stopped
     volumes:
       - chromadb_data:/chroma/chroma
+      - chroma_cache:/root/.cache
     healthcheck:
       # chromadb takes a moment to actually accept requests after the
       # container starts; without this, backend/ai-worker could try to
@@ -105,3 +106,4 @@ volumes:
   postgres_data:
   rabbitmq_data:
   chromadb_data:
+  chroma_cache:
