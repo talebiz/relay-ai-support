@@ -75,6 +75,8 @@ def build_chat_model(config: LLMProviderConfig) -> BaseChatModel:
             api_key=config.api_key,
             base_url=config.base_url,
             temperature=config.temperature,
+            timeout=30,
+            max_retries=1,
         )
 
     if config.provider == LLMProvider.ANTHROPIC:

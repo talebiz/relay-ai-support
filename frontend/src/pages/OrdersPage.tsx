@@ -15,7 +15,11 @@ function formatPrice(cents: number): string {
   return (cents / 100).toLocaleString("fa-IR", { style: "currency", currency: "USD" });
 }
 
-export default function OrdersPage() {
+interface OrdersPageProps {
+  onSelectOrder: (orderId: string) => void;
+}
+
+export default function OrdersPage({ onSelectOrder }: OrdersPageProps) {
   const { user, logout } = useAuth();
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +70,11 @@ export default function OrdersPage() {
           </thead>
           <tbody>
             {orders.map((order) => (
-              <tr key={order.id}>
+              <tr
+                key={order.id}
+                className="orders-table-row"
+                onClick={() => onSelectOrder(order.id)}
+              >
                 {isSupportAgent && <td>{order.username}</td>}
                 <td>{order.product.name}</td>
                 <td>{order.quantity}</td>

@@ -20,6 +20,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # no-op there; it only matters for local (non-Docker) development.
 load_dotenv(BASE_DIR.parent / ".env")
 
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # --- Core security settings ---
 

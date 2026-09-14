@@ -296,8 +296,10 @@ def fetch_order_for_user(acting_user_id: int, order_id: str) -> dict | None:
     path where a row for another user's order is ever pulled into this
     process's memory in the first place, for a plain customer.
     """
+
+    clean_id = str(order_id).strip("{}").strip()
     try:
-        uuid.UUID(str(order_id))
+        uuid.UUID(clean_id)
     except (ValueError, TypeError):
         return None
     
