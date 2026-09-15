@@ -81,6 +81,7 @@ services:
       - CHROMADB_HOST=chromadb
     volumes:
       - ./ai-worker:/app
+      - worker_model_cache:/root/.cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,3 +108,4 @@ volumes:
   rabbitmq_data:
   chromadb_data:
   chroma_cache:
+  worker_model_cache:

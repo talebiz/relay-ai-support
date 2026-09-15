@@ -248,7 +248,8 @@ export function useConversationStream(conversationId: string | null, correlation
 
     source.onmessage = (message: MessageEvent<string>) => {
       try {
-        const parsed = JSON.parse(message.data) as AgentEvent;
+        const raw = JSON.parse(message.data);
+        const parsed = { ...raw, type: raw.type ?? raw.message_type } as AgentEvent;
         handleEvent(parsed);
       } catch {
         // Malformed frame - ignore it rather than crashing the whole

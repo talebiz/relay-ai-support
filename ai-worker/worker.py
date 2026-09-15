@@ -104,6 +104,8 @@ attempted here.
 
 import json
 import os
+import queue
+import threading
 import time
 import traceback
 
@@ -114,6 +116,7 @@ from db import (
     DuplicateMessageError,
     already_processed,
     fetch_conversation_history,
+    fetch_order_for_user,
     mark_processed,
     save_assistant_message_with_tool_calls,
 )
@@ -137,6 +140,60 @@ RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
 # simple, and good enough to keep the number of RabbitMQ/SSE messages
 # per reply small without pulling in a tokenizer just for this.
 DELTA_BUFFER_CHARS = 40
+
+# Hard wall-clock ceiling on a single agent run (LLM calls + every tool
+# call combined), independent of whatever timeout llm/factory.py asked
+# the provider's SDK for. This exists because that per-provider timeout
+# turned out NOT to be a sufficient backstop on its own: with a
+# network path that silently black-holes packets (observed in
+# practice with LLM_PRIMARY_PROVIDER=google_genai against a blocked/
+# unreachable endpoint), the underlying google-generativeai client
+# hung well past its configured `timeout=30`, because that timeout is
+# not honored by every code path in that SDK's transport layer. A
+# provider/network stall that langchain's own timeout does not catch
+# would otherwise block this line of run_agent forever - and because
+# the worker consumes with `basic_qos(prefetch_count=1)` and never
+# acks/nacks while stuck, that is a silent full outage: no further
+# command is ever picked up, not just this one. Running the graph on a
+# background thread and enforcing this deadline from the main thread
+# (which alone owns the pika `channel` - pika objects are not
+# thread-safe, so the background thread only ever pushes plain data
+# into `queue.Queue`, never touches `channel`) guarantees run_agent
+# returns within this budget no matter what the provider SDK does,
+# feeding the existing retry/backoff/DLQ + AGENT_RUN_FAILED path
+# (project brief 3(b)) instead of hanging.
+#
+# Set to match the frontend's own AWAITING_RESPONSE_TIMEOUT_MS
+# (useConversationStream.ts) - the point the UI itself already treats
+# a turn as "taking too long", so the backend's hard ceiling is not
+# looser than the promise the UI is already making to the user.
+AGENT_RUN_TIMEOUT_SECONDS = 45
+
+class AgentRunTimeoutError(Exception):
+    """Raised when one agent run exceeds AGENT_RUN_TIMEOUT_SECONDS."""
+
+
+def _stream_graph_in_background(graph, messages, graph_config, out_queue: queue.Queue) -> None:
+    """
+    Runs on a background thread: drives `graph.stream(...)` (which may
+    block for a long time inside a provider HTTP/gRPC call or a tool's
+    own I/O) and forwards every item to `out_queue` for the main thread
+    to consume. Never touches the pika `channel` - see
+    AGENT_RUN_TIMEOUT_SECONDS's docstring for why that matters.
+    """
+    try:
+        for item in graph.stream(
+            {"messages": messages},
+            config=graph_config,
+            stream_mode=["messages", "updates"],
+        ):
+            out_queue.put(("item", item))
+    except Exception as exc:  # noqa: BLE001 - forwarded to the main thread, not swallowed
+        print(f"[bg-thread] ERROR: {type(exc).__name__}: {exc}", flush=True)
+        out_queue.put(("error", exc))
+    finally:
+        out_queue.put(("done", None))
+
 
 # Built lazily, once per worker process - constructing a LangChain chat
 # model only wires up an HTTP client, it makes no network call itself,
@@ -183,6 +240,7 @@ def run_agent(channel, envelope: Envelope) -> None:
     correlation_id = envelope.correlation_id
     conversation_id = envelope.payload.get("conversation_id")
     acting_user_id = envelope.payload.get("acting_user_id")
+    order_id = envelope.payload.get("order_id")
     user_text = envelope.payload.get("text", "")
 
     publish_event(
@@ -203,7 +261,10 @@ def run_agent(channel, envelope: Envelope) -> None:
     # visible; build_initial_messages tolerates either case (see its
     # own docstring) so this history is never duplicated in the prompt.
     history = fetch_conversation_history(conversation_id) if conversation_id else []
-    messages = build_initial_messages(history, user_text)
+    order_context = None
+    if order_id and acting_user_id:
+        order_context = fetch_order_for_user(acting_user_id, order_id)
+    messages = build_initial_messages(history, user_text, order_context=order_context)
 
     model = _get_chat_model()
     graph = build_agent_graph(model, acting_user_id)
@@ -238,18 +299,49 @@ def run_agent(channel, envelope: Envelope) -> None:
     # commit 1's coarser "wait for the whole message" approach - is
     # what makes AGENT_RESPONSE_CHUNK events genuine incremental
     # deltas instead of one big flush at the end.
-    for stream_kind, chunk in graph.stream(
-        {"messages": messages},
-        config=graph_config,
-        stream_mode=["messages", "updates"],
-    ):
+    event_queue: queue.Queue = queue.Queue()
+    background_thread = threading.Thread(
+        target=_stream_graph_in_background,
+        args=(graph, messages, graph_config, event_queue),
+        daemon=True,
+        name=f"agent-run-{envelope.message_id}",
+    )
+    background_thread.start()
+
+    deadline = time.monotonic() + AGENT_RUN_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The background thread is left running (daemon=True) since
+            # Python cannot forcibly cancel a blocked network call; we
+            # simply stop waiting on it so this command can be routed
+            # to retry/DLQ and the worker can move on to the next
+            # message instead of hanging forever. See
+            # AGENT_RUN_TIMEOUT_SECONDS's docstring above.
+            raise AgentRunTimeoutError(
+                f"Agent run exceeded {AGENT_RUN_TIMEOUT_SECONDS}s wall-clock budget "
+                "(a provider or tool call likely hung without honoring its own timeout)."
+            )
+
+        try:
+            kind, value = event_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+
+        if kind == "error":
+            raise value
+        if kind == "done":
+            break
+
+        stream_kind, chunk = value
+
         if stream_kind == "messages":
             message_chunk, _metadata = chunk
             # Only agent_node's own token stream has real text content
             # to relay; ToolMessage chunks (tool node) carry step
             # results, not narration, and are handled via "updates"
             # below instead.
-            if getattr(message_chunk, "type", None) == "ai":
+            if getattr(message_chunk, "type", None) in ("ai", "AIMessageChunk"):
                 piece = message_chunk.content or ""
                 if piece:
                     reply_text_parts.append(piece)
@@ -307,7 +399,6 @@ def run_agent(channel, envelope: Envelope) -> None:
 
     _publish_buffered_delta(channel, delta_buffer, correlation_id)
     reply_text = "".join(reply_text_parts)
-
     if conversation_id:
         save_assistant_message_with_tool_calls(
             conversation_id,

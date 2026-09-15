@@ -247,7 +247,11 @@ def build_agent_graph(model: BaseChatModel, acting_user_id: int):
     return graph.compile(checkpointer=checkpointer)
 
 
-def build_initial_messages(history: list[dict], current_user_text: str) -> list[BaseMessage]:
+def build_initial_messages(
+    history: list[dict],
+    current_user_text: str,
+    order_context: dict | None = None,
+) -> list[BaseMessage]:
     """
     Converts the plain dict rows from db.fetch_conversation_history
     into LangChain message objects, prefixed with the system prompt -
@@ -261,10 +265,28 @@ def build_initial_messages(history: list[dict], current_user_text: str) -> list[
     passing it explicitly removes that ambiguity. If the history
     already ends with this exact text (the common case), it is not
     duplicated.
+
+    `order_context`, when provided, is appended to the system prompt
+    so the agent already knows which order this conversation is about
+    without the customer having to state their order id.
     """
     from langchain_core.messages import AIMessage, HumanMessage
 
-    messages: list[BaseMessage] = [SystemMessage(content=SUPPORT_SYSTEM_PROMPT)]
+    system_text = SUPPORT_SYSTEM_PROMPT
+    if order_context:
+        system_text += (
+            f"\n\n--- Current order context ---\n"
+            f"This conversation is about order {order_context.get('id')}.\n"
+            f"Customer: {order_context.get('username')}\n"
+            f"Product: {order_context.get('product_name')}\n"
+            f"Quantity: {order_context.get('quantity')}\n"
+            f"Status: {order_context.get('status')}\n"
+            f"Tracking: {order_context.get('tracking_number') or 'N/A'}\n"
+            f"You already have the order id — use get_order_info with it "
+            f"directly instead of asking the customer for it."
+        )
+
+    messages: list[BaseMessage] = [SystemMessage(content=system_text)]
     for entry in history:
         if entry["role"] == "user":
             messages.append(HumanMessage(content=entry["content"]))

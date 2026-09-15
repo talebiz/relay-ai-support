@@ -34,6 +34,19 @@ Design:
    swaps never require a code change or redeploy - only a `.env` edit
    and a container restart (see .env.example: LLM_PRIMARY_* /
    LLM_FALLBACK_*).
+
+5. Every branch of `build_chat_model` sets an explicit `timeout`
+   (network calls have no default upper bound otherwise) and
+   `max_retries=1` (let this project's own retry/backoff queues -
+   messaging/topology.py - own the retry policy, not a second,
+   invisible retry loop inside the LangChain client). Without a
+   client-side timeout, a request that a provider or network never
+   answers (e.g. a blocked/unreachable endpoint) blocks `run_agent`
+   forever: the single worker process (`basic_qos(prefetch_count=1)`)
+   never acks, never nacks, and never picks up another command - a
+   silent full outage instead of the AGENT_RUN_FAILED + retry/DLQ path
+   the project brief's reliability requirements (section 3(b)) already
+   handle for every other kind of failure.
 """
 
 from __future__ import annotations
@@ -86,6 +99,8 @@ def build_chat_model(config: LLMProviderConfig) -> BaseChatModel:
             model=config.model,
             api_key=config.api_key,
             temperature=config.temperature,
+            timeout=30,
+            max_retries=1,
         )
 
     if config.provider == LLMProvider.GOOGLE_GENAI:
@@ -95,6 +110,8 @@ def build_chat_model(config: LLMProviderConfig) -> BaseChatModel:
             model=config.model,
             google_api_key=config.api_key,
             temperature=config.temperature,
+            timeout=30,
+            max_retries=1,
         )
 
     raise ValueError(f"Unknown LLM provider: {config.provider!r}")

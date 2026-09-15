@@ -89,6 +89,7 @@ class SendMessageView(APIView):
                 # hint an LLM could talk its way around.
                 "acting_user_id": request.user.id,
                 "conversation_id": str(conversation.id),
+                "order_id": str(conversation.order_id),
                 "user_message_id": str(user_message.id),
                 "text": text,
             },
