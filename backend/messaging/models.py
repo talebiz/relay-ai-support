@@ -24,21 +24,31 @@ a worker crash, which means: the database.
 
 How it is used (see ai-worker's handler, worker.py):
 
-    1. Before doing any real work for a command, the worker tries to
-       INSERT a ProcessedMessage row for this envelope's message_id.
-    2. `message_id` has a UNIQUE constraint. If a second delivery of
-       the same message arrives (whether concurrently or after a
-       crash-and-redeliver), the INSERT hits a UniqueViolation.
-    3. On UniqueViolation, the worker knows this exact message was
-       already handled (or is being handled right now) and skips the
-       side-effecting work entirely, then acks immediately - this is
-       what makes redelivery safe (the "answer" to "what happens if
-       the same command arrives twice": nothing happens the second
-       time; the ack is sent and RabbitMQ stops redelivering it).
-    4. The INSERT and the command's actual side effect (e.g. creating
-       a RefundRequest) happen in the SAME database transaction, so a
-       crash between "recorded as processed" and "side effect applied"
-       cannot happen - either both commit or neither does.
+    1. Before doing any real work for a command, the worker does a
+       cheap SELECT via `already_processed(message_id)`. If a previous
+       delivery already finished, the worker skips the agent entirely
+       and acks - the common case for a late redelivery.
+    2. If the early check does not short-circuit, the worker runs the
+       agent (publishing events and executing tool side effects), and
+       ONLY THEN INSERTs the ProcessedMessage row for this envelope's
+       message_id as the last step before ack.
+    3. `message_id` has a UNIQUE constraint. Two deliveries that raced
+       past the early check at nearly the same moment will both run
+       the agent, but only one INSERT wins; the other raises
+       UniqueViolation and is treated as "already handled" - ack, no
+       further side effects.
+
+Known limitation (documented in worker.py's module docstring):
+
+    The INSERT and the command's side effects (publishing events on
+    RabbitMQ, executing action tools like create_refund_request) are
+    NOT in one atomic transaction - they cannot be, because RabbitMQ
+    and PostgreSQL are two separate systems that this project does not
+    bridge with a transactional outbox. Ordering the INSERT LAST
+    minimizes the risk window (a crash between the side effect and the
+    INSERT means a redelivery will re-run the agent), but does not
+    eliminate it. This is called out explicitly rather than hidden;
+    closing it fully is out of scope for this project's size.
 
 This model is intentionally tiny: it does not need columns beyond what
 answers "have we already done this exact message" and basic

@@ -1,708 +1,453 @@
-# Relay — AI-Powered Customer Support Assistant
+# Relay — Agentic Customer Support Assistant
 
-نام: محمدپارسا طالبی زاده
+**Author:** Mohammadparsa Talebizadeh
 
-## بخش ۳ — معماری رویدادمحور با RabbitMQ
-
-### چرا این بخش مهم‌ترین تفاوت با دوره است
-
-در دوره‌ی مرجع، عامل داخل همان چرخه‌ی درخواست/پاسخ Django اجرا می‌شود و یک worker وب
-را برای کل مدت اجرا (چند ثانیه) اشغال می‌کند. در Relay، لایه‌ی وب و لایه‌ی اجرای هوش
-مصنوعی (`ai-worker`) دو پردازه‌ی جدا هستند که فقط از طریق RabbitMQ حرف می‌زنند:
+Relay is a customer-support assistant where the web layer and the AI
+execution layer are **two separate processes** that talk only through
+a message queue. A user asks about their order, a company policy, or
+something in the outside world; the agent decides which knowledge
+source to consult (database, internal documents, public web) and can
+take one real action (file a refund). A single `correlation_id`
+follows one user turn through all four processes.
 
 ```
-React → Django (وب) --command--> RabbitMQ --> ai-worker (عامل)
-                                                    |
-Django (SSE) <--event-- RabbitMQ <-----------------+
+      ┌───── events → RabbitMQ → Django SSE ─────┐
+      │                                          │
+      ▼                                          │
+   React ──► Django + DRF ──► RabbitMQ ──► AI Worker ──► LLM
+             (ASGI)                             │
+                │                               │
+                ▼                               ▼
+       PostgreSQL, ChromaDB            LangGraph, tools
+                                        RAG, web search
 ```
-
-`RabbitMQ` تنها پل بین backend و ai-worker است. PostgreSQL و ChromaDB منابع مشترکی
-هستند که هر دو سرویس مستقیماً به آن‌ها متصل می‌شوند.
-
-### Command در برابر Event
-
-| | Command | Event |
-|---|---|---|
-| معنی | «این کار را انجام بده» | «این اتفاق افتاد» |
-| مصرف‌کننده | دقیقاً یک (ai-worker) | صفر یا چند |
-| مسیر | صف `agent_commands` | exchange نوع fanout (`agent_events_exchange`) |
-| خطا | نیازمند retry/backoff/DLQ | عدم تحویل لزوماً خطا نیست |
-
-پیاده‌سازی این تمایز در `messaging/envelope.py` (`MessageKind`) و
-`messaging/topology.py` است: صف command دقیقاً یک consumer دارد، اما رویدادها به یک
-exchange فن‌اوت می‌روند و هر اتصال SSE صف اختصاصی و کوتاه‌عمر خودش را می‌سازد — چون
-ناشر نباید بداند چه کسی گوش می‌دهد.
-
-**Commandها:** `command.process_user_message`
-
-**Eventها:** `agent_run_started`, `agent_response_chunk`, `agent_tool_called`,
-`agent_run_completed`, `agent_run_failed`, `agent_run_usage` (بخش ۷)
-
-### Envelope مشترک
-
-هر پیام (command یا event) این شکل را دارد (`messaging/envelope.py::Envelope`):
-
-```json
-{
-  "message_id": "UUID - کلید idempotency، مخصوص همین پیام روی سیم",
-  "correlation_id": "UUID - مشترک بین کل پیام‌های یک تعامل کاربر",
-  "kind": "command | event",
-  "message_type": "مثلاً command.process_user_message",
-  "schema_version": 1,
-  "occurred_at": "ISO-8601 UTC",
-  "producer": "backend | ai-worker",
-  "retry_count": 0,
-  "payload": { "...": "..." }
-}
-```
-
-`message_id` و `correlation_id` دو مفهوم متفاوتند: یک command می‌تواند چند event
-تولید کند که همه یک `correlation_id` دارند اما `message_id` های جدا.
-
-این فایل عمداً هم در `backend/messaging/envelope.py` و هم در `ai-worker/envelope.py`
-تکرار (نه import) شده، چون این دو سرویس دو ایمیج مستقل با dependency جدا هستند و
-اشتراک کد بین‌شان پیچیدگی عملیاتی غیرضروری اضافه می‌کند. اگر شکل envelope تغییر کند،
-باید دستی در هر دو جا هماهنگ شود.
-
-### قابلیت اطمینان (Reliability)
-
-**Manual ack:** `ai-worker/worker.py` هرگز auto-ack نمی‌کند؛ `basic_qos(prefetch_count=1)`
-تضمین می‌کند پیام بعدی تا ack نشدن پیام فعلی تحویل داده نشود.
-
-**Retry با backoff نمایی:** به‌جای پلاگین اضافه، از الگوی Dead Letter Exchange + صف‌های
-TTL استفاده شده (`messaging/topology.py`): سه صف retry با TTL ۱، ۴ و ۱۶ ثانیه که با
-انقضای پیام، آن را به صف اصلی برمی‌گردانند. بعد از اتمام retryها، پیام مستقیم به
-`agent_commands.dlq` می‌رود و یک `agent_run_failed` هم منتشر می‌شود.
-
-**Idempotency در دیتابیس:** جدول `messaging_processedmessage` با constraint یکتا روی
-`message_id`. این تضمین با دو تابع جدا در `ai-worker/db.py` پیاده شده، که در دو نقطه‌ی
-متفاوت از `worker.py::handle_command` صدا زده می‌شوند:
-
-1. `already_processed(message_id)` — یک `SELECT` ارزان، **قبل از** اجرای عامل. اگر
-   این پیام قبلاً کامل پردازش شده (رایج‌ترین حالت redelivery)، worker بدون اجرای
-   دوباره‌ی عامل و بدون انتشار دوباره‌ی هیچ eventی، بلافاصله ack می‌کند.
-2. `mark_processed(message_id, ...)` — `INSERT` واقعی، **بعد از** اتمام کامل کار عامل
-   (و انتشار همه‌ی eventهایش)، درست قبل از ack. اگر دو تحویل هم‌زمان از چک اول رد شده
-   باشند (race نادر)، فقط یکی از این دو `INSERT` موفق می‌شود؛ دیگری با
-   `DuplicateMessageError` مواجه شده و بدون کار اضافه ack می‌شود.
-
-این دو مرحله عمداً جدا از هم و در دو زمان متفاوت هستند، نه در یک تراکنش واحد دور کل
-کار عامل: انتشار event روی RabbitMQ و نوشتن در PostgreSQL دو سیستم مجزا هستند که
-نمی‌توان آن‌ها را در یک commit اتمی واحد بست (بدون یک الگوی پیشرفته‌تر مثل
-transactional outbox که برای این پروژه خارج از محدوده است). نوشتن ثبت نهایی به‌عنوان
-آخرین قدم ممکن، پنجره‌ی خطر را تا حد زیادی کوچک می‌کند اما کاملاً حذفش نمی‌کند — به
-بخش «محدودیت شناخته‌شده» زیر نگاه کنید.
-
-#### پاسخ به دو پرسش الزامی سند
-
-**اگر همان فرمان دو بار برسد چه می‌شود؟**
-تضمین واقعی RabbitMQ «حداقل یک‌بار تحویل» است، نه دقیقاً یک‌بار. در رایج‌ترین حالت،
-`already_processed` این را زودهنگام تشخیص می‌دهد و worker بدون اجرای دوباره‌ی هیچ
-کاری ack می‌کند. در حالت نادرتر (race بین دو تحویل هم‌زمان)، محدودیت یکتای دیتابیس در
-`mark_processed` تضمین می‌کند فقط یکی به‌عنوان «پردازش‌شده» ثبت شود.
-
-**اگر worker پیش از تأیید از کار بیفتد چه می‌شود؟**
-چون ack فقط دستی و بعد از موفقیت کامل فرستاده می‌شود، RabbitMQ در صورت کرش worker
-پیام را دوباره تحویل می‌دهد. اگر کرش **بعد از** `mark_processed` باشد، تحویل دوباره
-کاملاً بی‌خطر است. اگر کرش **بین انتشار eventها و `mark_processed`** باشد، محدودیتی
-واقعی باقی می‌ماند که در ادامه توضیح داده شده.
-
-#### محدودیت شناخته‌شده
-
-اگر worker دقیقاً بعد از انتشار موفق eventهای عامل (که کاربر آن‌ها را در SSE دیده) ولی
-قبل از موفقیت `mark_processed` کرش کند، eventها قابل بازگشت نیستند اما دیتابیس هنوز
-نمی‌داند این پیام پردازش شده؛ تحویل دوباره باعث اجرای مجدد عامل و انتشار دوباره‌ی همان
-eventها می‌شود — یعنی کاربر ممکن است پاسخ را دو بار در SSE ببیند. راه‌حل کامل این مورد
-(transactional outbox) پیچیدگی عملیاتی بیشتری نیاز دارد که برای اندازه‌ی این پروژه
-توجیه‌پذیر نیست؛ تصمیم گرفته شد این پنجره‌ی خطر را با ترتیب‌دهی دقیق تا حد امکان کوچک
-نگه داریم و صریح مستندش کنیم، نه این‌که ادعا کنیم کاملاً حل شده.
-
-### correlation_id
-
-یک‌بار در `conversations/models.py::Conversation.correlation_id` ساخته می‌شود (وقتی
-مکالمه‌ی مربوط به یک سفارش برای اولین‌بار ساخته می‌شود) و **بدون تغییر برای کل عمر آن
-مکالمه** جریان پیدا می‌کند: هر پیام کاربر → command → ai-worker → همه‌ی eventهای آن
-اجرا → (بعداً) Langfuse → SSE view که با همین id فیلتر می‌کند کدام رویداد مال کدام
-اتصال مرورگر است → React. (در بخش ۳ این id به‌صورت موقت هر درخواست را تازه تولید
-می‌کرد؛ این محدودیت در بخش ۴ commit ۱ برطرف شد — به پایین‌تر نگاه کنید.)
-
-### پخش زنده (SSE)
-
-`streaming/views.py::conversation_stream` یک async view روی ASGI است. هر اتصال SSE
-صف اختصاصی و auto-delete خودش را می‌سازد و به exchange رویدادها بایند می‌کند — دقیقاً
-مطابق الزام «هر اتصال اشتراک کوتاه‌عمر خودش را داشته باشد».
-
-این view هیچ حافظه‌ای از قبل از باز شدن اتصال ندارد؛ صرفاً یک رله‌ی زنده است. اگر تب
-مرورگر وسط جریان قطع و وصل شود، فقط رویدادهای بعد از reconnect را می‌بیند. منبع حقیقتِ
-«واقعاً چه پاسخی تولید شد» پایگاه‌داده است (`conversations.Message`، بخش ۴)، نه استریم
-SSE؛ وظیفه‌ی فرانت‌اند در reconnect این است که تاریخچه‌ی گفتگو را از
-`GET /api/conversations/<id>/messages/` (یک endpoint REST متکی بر دیتابیس) دوباره
-بخواند و بعد به شنیدن جریان زنده ادامه دهد.
 
 ---
 
-## بخش ۴ (Commit ۱) — زیرساخت پایه: مکالمات، LLM Factory، تولید پاسخ واقعی بدون ابزار
+## 1. Getting started
 
-این commit سه محدودیتی که در پایان بخش ۳ صریحاً به‌عنوان TODO ثبت شده بودند را حل
-می‌کند، و زیرساخت لازم برای گراف واقعی LangGraph (commit ۲) را آماده می‌کند — بدون
-این‌که هنوز خود گراف یا ابزارهایش وجود داشته باشند.
-
-### ۱. اپ `conversations` (Django) — منبع حقیقتِ تاریخچه‌ی چت
-
-دو مدل در `backend/conversations/models.py`:
-
-- **`Conversation`**: دقیقاً یک مکالمه به‌ازای هر سفارش (`order` یک `OneToOneField`
-  است)، با `correlation_id` یکتا که یک‌بار ساخته و برای همیشه استفاده می‌شود.
-- **`Message`**: هر پیام (`role`: user/assistant)، با فیلد اختیاری
-  `tool_calls_json` که هنوز خالی می‌ماند (برای commit ۲، وقتی ابزار واقعی وجود داشته
-  باشد و نمایش «فعالیت عامل» در UI لازم شود).
-
-`conversations/services.py` دقیقاً همان الگوی `orders/services.py` را تکرار می‌کند:
-تنها نقطه‌ی مجاز برای پرس‌وجوی `Conversation`/`Message`، با قاعده‌ی «۴۰۴ نه ۴۰۳» و
-پشتیبان‌ها به همه‌چیز دسترسی دارند. نکته‌ی مهم: مالک یک مکالمه همیشه **صاحب سفارش**
-است، نه کاربری که آن را trigger کرده — اگر پشتیبان سفارش باب را باز کند، مکالمه به نام
-باب ساخته می‌شود، نه پشتیبان.
-
-Endpointها:
-- `GET/POST /api/orders/<order_id>/conversation/` → fetch-or-create
-- `GET /api/conversations/<id>/messages/` → resync تاریخچه (برای reconnect SSE)
-
-### ۲. `support/views.py` — پایدارسازی `correlation_id`
-
-`SendMessageView` دیگر هر بار یک `correlation_id` تصادفی نمی‌سازد. حالا:
-
-1. مکالمه را از طریق `conversations.services.get_conversation_for_user` پیدا می‌کند
-   (چک مالکیت — دقیقاً همان chokepoint بقیه‌ی پروژه).
-2. پیام کاربر را **همان لحظه، به‌صورت sync** در دیتابیس ذخیره می‌کند — قبل از این‌که
-   هیچ commandای منتشر شود.
-3. command را با `conversation.correlation_id` منتشر می‌کند (پایدار برای کل مکالمه).
-
-### ۳. `streaming/views.py` — رفع TODO مالکیت
-
-قبل از باز کردن اتصال SSE، توکن JWT از query param (`?token=...`) خوانده می‌شود (چون
-`EventSource` نمی‌تواند header بفرستد)، کاربر resolve می‌شود، و بعد
-`conversations.services.get_conversation_for_user_by_correlation_id` چک می‌کند این
-کاربر واقعاً مالک همین `correlation_id` هست یا نه. اگر نه، بدون باز کردن استریم، ۴۰۱ یا
-۴۰۴ برمی‌گردد.
-
-### ۴. `ai-worker/llm/factory.py` — انتزاع LLM با fallback خودکار
-
-- `LLMProvider`: سه حالت — `openai_compatible` (اکثر سرویس‌های رایگان مثل Groq و
-  OpenRouter، چون API شبیه OpenAI دارند) و `google_genai`. شاخه‌ی مستقیم
-  `anthropic` حذف شد: این پروژه فقط به یک endpointِ سازگار با OpenAI یا به Gemini
-  وصل می‌شود، پس `langchain-anthropic` پکیجی بود که هیچ مسیر کدی به آن نمی‌رسید.
-  این یعنی مدل‌های Claude غیرقابل‌استفاده نیستند — یک aggregator مثل OpenRouter
-  آن‌ها را روی همان API شبیه‌OpenAI سرو می‌کند، که دقیقاً کاربرد
-  `openai_compatible` است (نرخ‌هایشان هم در `pricing.py` سر جایش مانده).
-- `build_chat_model(config)` تنها جایی است که کتابخانه‌ی اختصاصی هر provider را
-  import می‌کند؛ بقیه‌ی کد (از جمله گراف عامل در commit ۲) فقط با `BaseChatModel`
-  کار می‌کند.
-- `bind_tools_with_fallback(models, tools)` با `.with_fallbacks()` خودِ LangChain، مدل
-  دوم را در صورت شکست مدل اول (rate limit، timeout، خطای provider) خودکار جایگزین
-  می‌کند — همان بخش امتیازی «بازگشت خودکار به مدل دوم». روی این استقرار مدل دوم
-  `google_genai` است (`gemini-2.0-flash`).
-
-  **ترتیب اینجا حیاتی است، و اشتباهش فقط وقتی معلوم می‌شود که fallback واقعاً فعال
-  باشد.** `.with_fallbacks()` یک `RunnableWithFallbacks` برمی‌گرداند که `.invoke()` و
-  `.stream()` دارد ولی `.bind_tools()` **ندارد** (بررسی شد: در langchain-core 0.3.28
-  مقدار `hasattr(RunnableWithFallbacks, "bind_tools")` برابر `False` است). پس اگر
-  اول wrap کنید و بعد tool ببندید، هر اجرای عامل با `AttributeError` می‌شکند — و تا
-  وقتی هیچ fallbackی تنظیم نشده باشد آن wrapper هرگز ساخته نمی‌شود و باگ نامرئی
-  است. به همین دلیل tool‌ها اول به **هر دو** مدل بسته می‌شوند و بعد زنجیره‌ی
-  fallback ساخته می‌شود؛ این قاعده در یک تابع متمرکز شده تا هیچ call site لازم نباشد
-  یادش باشد. مزیت دومش: مدل دوم هم همان چهار ابزار را دارد — fallbackی که بی‌صدا
-  ابزارهایش را از دست بدهد از حافظه‌ی خودش جواب می‌دهد، که سند آن را «بدتر از پاسخ
-  اشتباه» می‌نامد.
-
-  یک محافظ هم اضافه شد: اگر `LLM_FALLBACK_PROVIDER` پر باشد ولی `LLM_FALLBACK_API_KEY`
-  خالی (و `BASE_URL` هم نباشد که به یک endpoint محلیِ بی‌کلید اشاره کند)، آن slot با
-  یک پیام رد می‌شود و ورکر با مدل اول کار می‌کند. چون ساختن آن مدل در زمان
-  construction خطا می‌دهد و آن خطا داخل `_get_chat_models()` رخ می‌دهد — یعنی **همه‌ی**
-  اجراها را می‌خواباند، از جمله آن‌هایی که مدل اولِ سالم می‌توانست جواب بدهد. توری
-  که کف را خراب کند تور نجات نیست.
-- پیکربندی کاملاً از env می‌آید (`LLM_PRIMARY_*` / `LLM_FALLBACK_*` در `.env.example`)؛
-  عوض‌کردن provider یا مدل نیاز به تغییر کد ندارد.
-
-### ۵. `ai-worker/db.py` و `worker.py` — پاسخ واقعی، هنوز بدون ابزار
-
-`db.py` دو تابع جدید دارد که مستقیم روی جدول `conversations_message` (ساخته‌شده
-توسط migration جنگو) کار می‌کنند، چون worker یک برنامه‌ی جنگو نیست:
-`fetch_conversation_history` (خواندن تاریخچه برای ساخت prompt) و
-`save_assistant_message` (نوشتن پاسخ نهایی — منبع حقیقت پاسخ).
-
-`worker.py::run_agent_placeholder` (اکو ساده‌ی بخش ۳) با `run_agent` جایگزین شد:
-تاریخچه از دیتابیس خوانده می‌شود، به مدل زبانی (از طریق `llm/factory.py`) داده
-می‌شود، پاسخ به‌صورت **stream** گرفته می‌شود ولی رویدادهای `agent_response_chunk`
-تنها هر ~۴۰ کاراکتر یک‌بار منتشر می‌شوند (نه به‌ازای هر token — الزام صریح بخش ۶
-سند)، و پاسخ نهایی در `Message` ذخیره می‌شود. عامل **هنوز هیچ ابزاری صدا نمی‌زند** و
-فقط بر پایه‌ی تاریخچه‌ی مکالمه پاسخ می‌دهد؛ اگر سؤال نیاز به دیتابیس/RAG/وب داشته
-باشد، طبق system prompt صادقانه می‌گوید که این قابلیت هنوز اضافه نشده. منطق
-idempotency/retry/DLQ اطراف آن (بخش ۳) دست‌نخورده ماند.
-
-### محدودیت‌های شناخته‌شده‌ی این commit
-
-- عامل هنوز **هیچ ابزاری** ندارد (نه دیتابیس سفارش، نه RAG، نه جست‌وجوی وب، نه ثبت
-  بازگشت وجه) — فقط یک فراخوانی تک‌مرحله‌ای LLM بر پایه‌ی تاریخچه‌ی مکالمه. گراف
-  LangGraph و ۴ ابزار در commit ۲ اضافه می‌شوند.
-- هنوز `Checkpointer`ی برای LangGraph وجود ندارد چون گراف واقعی هنوز ساخته نشده؛
-  در commit ۲ از `MemorySaver` استفاده خواهد شد (نه Postgres checkpointer)، چون
-  تاریخچه‌ی واقعی مکالمه از `conversations.Message` می‌آید، نه از حافظه‌ی گراف —
-  گراف فقط باید state یک اجرا را نگه دارد.
-- فرانت‌اند React هنوز به‌روزرسانی نشده (صفحه‌ی سفارش/چت/SSE) — commit ۳.
-- بافر رویدادهای تدریجی بر اساس تعداد کاراکتر است، نه توکن دقیق مدل؛ برای این اندازه
-  پروژه کافی است اما شمارش دقیق token (برای بخش ۷، رصدپذیری هزینه) هنوز اضافه نشده.
-
-### محدودیت‌های شناخته‌شده‌ی این مرحله (بخش ۳، هنوز باز)
-
-- `ai-worker/worker.py::run_agent` هنوز echo نیست ولی هنوز عامل واقعی LangGraph با
-  ابزار نیست؛ commit ۲ آن را جایگزین می‌کند بدون نیاز به تغییر منطق
-  idempotency/retry/DLQ اطراف آن.
-
-
-## بخش ۴ (Commit ۲) — چهار ابزار + گراف واقعی LangGraph
-
-این commit تک فراخوانی بدون ابزار commit ۱ را با عامل واقعی جایگزین می‌کند: یک گراف
-LangGraph که میان چهار ابزار مسیریابی می‌کند، دقیقاً طبق بخش ۴ سند پروژه.
-
-### چرا یک عامل، نه چند عامل همکار
-
-جدول بخش ۴ سند صریح است: «سه عامل همکار / یک گراف خوش‌ساخت / عمق نمره دارد، تعداد
-عامل نه». دوره‌ی مرجع سه عامل جدا می‌سازد (پشتیبان، مدیر، ریسک). این پروژه عمداً آن
-تقسیم را تکرار نمی‌کند — چون سناریوی «ریسک/تقلب» اصلاً بخشی از دامنه‌ی این سند نیست؛
-سند از مسیریابی میان **سه منبع دانش + یک ابزار اقدام** حرف می‌زند، نه از تشخیص تقلب.
-یک عامل با پرامپت سیستمی روشن درباره‌ی چگونگی انتخاب ابزار، پاسخ صادقانه‌تری به
-خواسته‌ی سند است تا سه عامل نمایشی با کار کمی برای تقسیم.
-
-### چهار ابزار (`ai-worker/tools/`)
-
-هرکدام Pydantic input schema اعتبارسنجی‌شده دارند (`tools/schemas.py`) — مدل نمی‌تواند
-پرس‌وجوی دلخواه بسازد:
-
-| ابزار | نوع دانش | فایل | ورودی |
-|---|---|---|---|
-| `get_order_info` | داده ساختاریافته داخلی | `order_tools.py` | فقط `order_id` |
-| `search_knowledge_base` | داده غیرساختاریافته داخلی (RAG) | `knowledge_base_tools.py` | `query` |
-| `web_search` | داده بیرونی (Tavily) | `web_search_tools.py` | `query` |
-| `create_refund_request` | **ابزار اقدام** (نوشتن) | `action_tools.py` | `order_id`, `reason` |
-
-**مجوزدهی در کد، نه در prompt:** `get_order_info` و `create_refund_request` با
-`acting_user_id` بسته می‌شوند (closure) — این مقدار مستقیماً از payload پیام صف
-می‌آید (که Django از JWT تایید‌شده در `support/views.py` استخراج کرده)، هرگز از
-چیزی که خود مدل زبانی می‌نویسد. `ai-worker/db.py` توابع جدیدی دارد
-(`fetch_order_for_user`, `fetch_refund_history_for_order`, `insert_refund_request`)
-که دقیقاً همان قاعده‌ی `backend/orders/services.py` را با psycopg خام تکرار می‌کنند —
-چون worker یک اپ جنگو نیست و نمی‌تواند آن ماژول را import کند، اما **قاعده** باید
-یکسان بماند. تستی که این ایزوله‌سازی را تایید می‌کند: دو نمونه‌ی جدا از یک ابزار،
-بسته‌شده با دو `acting_user_id` متفاوت، هرکدام فقط سفارش‌های خودشان را می‌بینند.
-
-**RAG حداقلی (بخش ۵ کاملش می‌کند):** `knowledge_base_tools.py` یک collection واقعی
-در ChromaDB با شباهت embedding واقعی می‌سازد، اما با یک corpus کوچک و hard-coded
-(سیاست بازگشت کالا/ارسال/گارانتی) به‌جای پایپ‌لاین کامل بارگذاری سند. تابع ابزار
-خودش واقعی است؛ فقط مرحله‌ی seed کردن سند موقتی است و در بخش ۵ با پایپ‌لاین واقعی
-جایگزین می‌شود بدون تغییر قرارداد ابزار. هر نتیجه `"source": "internal_document"`
-دارد تا هرگز با ارجاع وب اشتباه گرفته نشود (طبق الزام صریح بخش ۵).
-
-**Web search:** هر نتیجه `"source": "web"` دارد — دقیقاً نقطه‌ی مقابل RAG، برای
-جلوگیری از یکسان به‌نظر رسیدن دو نوع ارجاع.
-
-### گراف (`ai-worker/graph/agent_graph.py`)
-
-دو گره در حلقه: `agent` (مدل با چهار ابزار bind‌شده) و `tools`
-(`langgraph.prebuilt.ToolNode`). `should_continue` به `tools` می‌رود اگر آخرین پیام
-tool_calls داشته باشد، وگرنه `END`.
-
-- **سقف گام:** `AGENT_RECURSION_LIMIT = 8` به `graph.stream(..., config={"recursion_limit": ...})`
-  در `worker.py` پاس داده می‌شود — دقیقاً الزام بخش ۴: «حلقه گراف سقف تعداد گام داشته
-  باشد تا اعتبار شما را در یک درخواست نسوزاند».
-- **Checkpointer:** `MemorySaver`، نه Postgres checkpointer. دلیل: منبع حقیقتِ
-  تاریخچه‌ی مکالمه `conversations.Message` در PostgreSQL است (خوانده‌شده قبل از
-  فراخوانی گراف)؛ state خودِ گراف فقط باید طول یک اجرا (`graph.invoke`/`stream`) را
-  زنده بماند و با پایان آن اجرا کاملاً مصرف می‌شود. یک checkpointer سنگین‌تر برای
-  چیزی که در پایان هر تک‌اجرا دور ریخته می‌شود، پیچیدگی عملیاتی بدون فایده اضافه
-  می‌کرد.
-- **پرامپت سیستمی:** صراحتاً می‌گوید کدام ابزار برای کدام نوع سؤال است، و دو خطای
-  مهم‌تر از پاسخ اشتباه (طبق بخش ۴ سند) را نام می‌برد: جست‌وجوی وب برای چیزی که در
-  دیتابیس/اسناد داخلی بوده، و پاسخ از حافظه‌ی مدل در جایی که باید ابزار صدا زده
-  می‌شد.
-
-### پخش زنده‌ی واقعی (`worker.py::run_agent`)
-
-`graph.stream(..., stream_mode=["messages", "updates"])` دو نوع رویداد همزمان
-می‌دهد:
-
-- `"messages"`: توکن‌های واقعی مدل زبانی از داخل گره‌ی `agent` — این پخش زنده‌ی
-  واقعی(تر) توکن‌به‌توکن است (نسبت به commit ۱ که کل پیام را یک‌جا می‌گرفت)، که
-  همچنان طبق الزام بخش ۶ («رویدادهای تدریجی را بافر کنید») در بافرهای
-  `DELTA_BUFFER_CHARS`-کاراکتری منتشر می‌شود، نه به‌ازای هر token.
-- `"updates"`: خروجی کامل هر گره پس از اتمام — این‌جاست که `tool_calls` یک AIMessage
-  (لحظه‌ی تصمیم به فراخوانی ابزار) و محتوای یک `ToolMessage` (نتیجه‌ی واقعی ابزار)
-  در دسترس قرار می‌گیرند. هر تصمیم و هر نتیجه یک رویداد **واقعی** `AGENT_TOOL_CALLED`
-  منتشر می‌کند (نه placeholder) — این دقیقاً «پنل فعالیت زنده» است که بخش ۶ سند
-  برای جلسه‌ی ارائه می‌خواهد.
-
-پیام نهایی assistant، همراه با ردِ کامل فراخوانی ابزارها (`tool_calls_json`)، در
-`conversations.Message` ذخیره می‌شود (`db.py::save_assistant_message_with_tool_calls`)
-— برای بازسازی صحیح صفحه بعد از reconnect SSE و برای یک پنل «فعالیت عامل» در آینده.
-
-### محدودیت شناخته‌شده‌ی تازه در این commit
-
-منطق idempotency (بخش ۳) هنوز فقط INSERT جدول `messaging_processedmessage` را
-اتمی می‌کند. با اضافه‌شدن ابزار اقدام واقعی (`create_refund_request`)، محدودیت
-شناخته‌شده‌ی commit ۱ («eventهای منتشرشده قبل از crash تکرار می‌شوند») حالا شامل
-**اثر جانبی ابزار** هم می‌شود: اگر worker درست بعد از موفقیت `insert_refund_request`
-ولی قبل از `mark_processed` کرش کند، تحویل دوباره باعث **دو** `RefundRequest` واقعی
-می‌شود، نه فقط دو رویداد تکراری. این محدودیت به‌عمد باز مانده (نه پنهان‌شده) چون بستن
-کاملش به یک الگوی idempotency-key اختصاصی برای هر ابزار نیاز دارد که خارج از حوصله‌ی
-این پروژه است — دقیقاً همان تصمیمی که commit ۱ درباره‌ی eventها گرفت، حالا برای
-ابزارها هم صادق است.
-
-### آنچه هنوز باقی مانده
-
-- پایپ‌لاین واقعی بارگذاری سند (chunking، آپلود فایل) — بخش ۵.
-- شمارش دقیق token و نمایش هزینه در UI — بخش ۷.
-- صفحه‌ی React چت با وضعیت‌های اتصال SSE — commit ۳.
-- تأیید انسانی پیش از اجرای `create_refund_request` — بخش امتیازی، عمداً پیاده‌سازی
-  نشده.
-
-
-  ## بخش ۴ (Commit ۳) — صفحه‌ی چت React، جزئیات سفارش و بازپرداخت، اتصال SSE با وضعیت‌های اتصال
-
-این commit فرانت‌اند را از یک لیست ساده‌ی سفارش‌ها به رابط کاربری کامل چت تبدیل
-می‌کند: صفحه‌ی جزئیات سفارش با بازپرداخت و گفت‌وگوی زنده، متصل به pipeline
-رویدادمحوری که در بخش ۳ و Commit ۱ و ۲ ساخته شد.
-
-### ساختار جدید
-
-```
-frontend/src/
-├── types/domain.ts          # + Conversation, ChatMessage, AgentEvent, StreamConnectionState
-├── api/conversations.ts     # (جدید) conversation/message/SSE-url endpoints
-├── hooks/useConversationStream.ts  # (جدید) مدیریت اتصال SSE + state machine
-├── components/
-│   ├── ChatPanel.tsx        # (جدید) چت‌باکس با نمایش وضعیت اتصال و فعالیت ابزار
-│   └── RefundPanel.tsx      # (جدید) تاریخچه‌ی بازگشت وجه + فرم ثبت
-├── pages/
-│   ├── OrdersPage.tsx       # + کلیک روی سطر → OrderDetailPage
-│   └── OrderDetailPage.tsx  # (جدید) جزئیات سفارش + بازپرداخت + چت
-└── App.tsx                  # + روتینگ ساده (بدون کتابخانه‌ی router)
+```bash
+git clone <repo>
+cd relay-ai-support
+cp .env.example .env      # fill in LLM_PRIMARY_API_KEY (and optionally TAVILY_API_KEY)
+docker compose up --build
 ```
 
-### چرا بدون کتابخانه‌ی routing
+That is the whole install. Six services come up: `frontend`,
+`backend`, `ai-worker`, `postgres`, `rabbitmq`, `chromadb`.
 
-سند فقط سه صفحه می‌خواهد: «ورود، گفت‌وگو، اسناد» و صراحتاً می‌گوید زیبایی بصری نمره
-ندارد. با سه صفحه، یک state ساده در `App.tsx` (`selectedOrderId`) کاملاً کافی است؛
-اضافه‌کردن `react-router` برای این اندازه پیچیدگی غیرضروری اضافه می‌کرد.
+| Endpoint | URL |
+|---|---|
+| Web UI | http://localhost:5173 |
+| Django API | http://localhost:18080 |
+| RabbitMQ management | http://localhost:15672 |
 
-### `useConversationStream` — قلب Commit ۳
+Seed demo data (creates one admin support agent + several customers,
+all with password `password123`):
 
-این هوک دقیقاً سه چیزی که بخش ۶ سند می‌خواهد را پیاده می‌کند:
+```bash
+docker compose exec backend python manage.py seed_demo_data
+docker compose exec backend python manage.py seed_documents
+```
 
-**۱. مرز میان جریان (stream) و منبع حقیقت (record of system).**
-پیام‌ها (`messages`) *همیشه* از `GET /api/conversations/<id>/messages/` (دیتابیس)
-می‌آیند، نه از انباشتن رویدادهای SSE. رویدادهای زنده فقط در `liveTurn` (یک state
-موقت و جداگانه) نمایش داده می‌شوند تا کاربر حین تولید پاسخ چیزی ببیند؛ به محض
-رسیدن `agent_run_completed`، `liveTurn` پاک و `messages` دوباره از دیتابیس
-`resync` می‌شود. این دقیقاً پاسخ به سؤال سند است: «اگر جریان وسط تولید قطع شود،
-کاربر در نهایت چه می‌بیند؟» — نسخه‌ی واقعاً ذخیره‌شده در Postgres، نه هر چیزی که
-جریان تصادفاً موفق به رساندنش شده بود.
+---
 
-**۲. چهار وضعیت اتصال، همیشه از رویدادهای واقعی سرور.**
-`connecting` / `connected` / `reconnecting` / `disconnected` / `failed`
-(`StreamConnectionState`) مستقیماً از رویدادهای `EventSource` (`onmessage` با
-فریم `stream.connected`، و `onerror`) مشتق می‌شوند — نه یک نشانگر ساختگی. سند
-می‌گوید «توقف بی‌صدا هنگام قطع جریان، خطاست»؛ اینجا هر قطعی بلافاصله UI را به
-`reconnecting` می‌برد و `ConnectionBadge` در `ChatPanel.tsx` همیشه قابل مشاهده
-است، نه فقط وقتی مشکلی پیش می‌آید.
+## 2. Infrastructure & Docker Compose
 
-**۳. اتصال مجدد با backoff نمایی، نه تلاش بی‌نهایت ساکت.**
-`EventSource` مرورگر خودش retry دارد ولی تعداد تلاش را پنهان می‌کند و نمی‌گذارد
-بین «در حال تلاش» و «قطعاً شکست خورده» تمایز داد. این هوک به‌جای اتکا به آن، خودش
-چرخه‌ی عمر `EventSource` را مدیریت می‌کند: با هر خطا، اتصال قدیمی بسته می‌شود، یک
-تأخیر نمایی (۱، ۲، ۴، ۸، سقف ۱۰ ثانیه) طی می‌شود، و اتصال تازه باز می‌شود — همراه
-با یک `resyncMessages()` تازه، چون هر رویدادی که حین قطعی منتشر شده دیگر هرگز
-replay نمی‌شود (طبق مستندات خودِ `streaming/views.py`). بعد از ۶ تلاش پیاپی
-ناموفق، وضعیت به `failed` می‌رود و توقف می‌کند؛ دکمه‌ی «تلاش مجدد» در UI کاربر را
-قادر می‌سازد دستی دوباره تلاش کند.
+Six services in one `docker-compose.yml`, with `healthcheck` on every
+stateful one and `depends_on: condition: service_healthy` on the app
+services:
 
-### `ChatPanel.tsx` — رندر پیام‌ها و فعالیت زنده‌ی ابزار
+- **`postgres`** — system of record (users, orders, conversations,
+  messages, processed-message ledger, cost ledger).
+- **`rabbitmq`** — the *only* bridge between backend and ai-worker.
+- **`chromadb`** — vector store for RAG.
+- **`backend`** — Django + DRF on **ASGI (uvicorn)**. SSE must be
+  async, otherwise one long-lived stream would pin a whole worker
+  (the reason the reference course's single-process design is
+  explicitly rejected by the brief).
+- **`ai-worker`** — plain Python process running the LangGraph agent.
+- **`frontend`** — Vite/React + TypeScript.
 
-- پیام‌های ذخیره‌شده (`tool_calls_json`) و فعالیت زنده‌ی درحال‌اجرا هر دو رندر
-  می‌شوند، اما با استایل بصری متفاوت (`chat-bubble--live` نیم‌شفاف).
-- `ToolResultBadge` نتیجه‌ی هر ابزار را با برچسب منبع نشان می‌دهد: «سند داخلی»
-  (آبی)، «نتیجه‌ی وب» (نارنجی)، «پایگاه داده‌ی سفارش‌ها»، یا «اقدام انجام‌شده» —
-  دقیقاً الزام صریح بخش ۵ سند که ارجاع به سند داخلی نباید با ارجاع وب یکسان به نظر
-  برسد؛ اینجا حتی رنگ badge هم متفاوت است.
-- حین اجرای عامل، `live-activity` نام هر ابزاری که صدا زده می‌شود را با یک نقطه‌ی
-  پالسی زرد (در حال اجرا) یا سبز (تمام‌شده) نشان می‌دهد — «پنل فعالیت زنده»ی بخش ۶.
+**Why these choices matter:**
 
-### `OrderDetailPage.tsx` — چیدمان صفحه
+- **Service name, not `localhost`.** Every container has its own
+  `localhost`, so `localhost:5432` from Django would look for
+  Postgres *inside the Django container*. Compose's embedded DNS
+  resolves the service name (`postgres`, `rabbitmq`, `chromadb`) to
+  the right container on the shared bridge network — stable across
+  restarts, unlike the container's IP.
 
-دقیقاً مطابق چیدمان دوره‌ی مرجع (چت مانت‌شده کنار جزئیات یک سفارش)، اما با دو
-ستون در React: ستون اصلی (جزئیات سفارش + `RefundPanel`) و ستون چت
-(`ChatPanel`, sticky). مکالمه (`Conversation`) یک‌بار در mount این صفحه با
-`fetchOrCreateConversation` گرفته می‌شود؛ `ChatPanel` تنها زمانی mount می‌شود که
-هم `id` و هم `correlation_id` مکالمه در دسترس باشند، چون اتصال SSE روی
-`correlation_id` کلید می‌خورد.
+- **`healthcheck`, not just `depends_on`.** `depends_on` only means
+  *started*, not *ready to accept connections* — Postgres and
+  RabbitMQ take several seconds to initialize. A real readiness
+  probe (`pg_isready`, `rabbitmq-diagnostics ping`, a Chroma
+  heartbeat) plus `condition: service_healthy` stops `backend` and
+  `ai-worker` from racing their dependencies and crashing on first
+  connect.
 
-### `RefundPanel.tsx` — مسیر REST مستقل از چت
+- **Named volumes** hold Postgres/RabbitMQ/Chroma data outside any
+  single container's lifetime, so a plain `docker compose down` /
+  rebuild does not wipe seeded users, uploaded documents, or the
+  RabbitMQ queues. Only `docker compose down -v` clears them.
 
-فرم ثبت بازگشت وجه مستقیماً `POST /api/refunds/` را صدا می‌زند — کاملاً مستقل از
-ابزار `create_refund_request` در گراف عامل. هر دو مسیر (فرم مستقیم کاربر، یا
-درخواست از طریق چت با مایا) دقیقاً به همان تابع `orders/services.py::create_refund_request`
-می‌رسند، پس تضمین مجوزدهی برای هر دو یکسان است — نیازی به منطق authorization
-جداگانه در فرانت‌اند نیست.
+---
 
-### تصمیم طراحی: چرا پیام کاربر بلافاصله resync می‌شود، نه optimistic UI
+## 3. Domain & Authorization
 
-`ChatPanel.tsx::handleSubmit` بعد از `sendMessage` بلافاصله `resyncMessages()` را
-صدا می‌زند، به‌جای این‌که پیام کاربر را مستقیم (optimistic) به state اضافه کند.
-این ممکن است یک تأخیر شبکه‌ی کوچک اضافه کند، اما چون Django پیام کاربر را
-**همزمان (sync)** در `support/views.py` قبل از بازگشت پاسخ HTTP ذخیره می‌کند
-(بخش ۴ Commit ۱)، این resync همیشه پیام را واقعاً پیدا می‌کند — و از هرگونه
-دوگانگی بین «چیزی که فرانت‌اند نشان می‌دهد» و «چیزی که واقعاً در دیتابیس هست»
-جلوگیری می‌کند؛ همان اصل «دیتابیس منبع حقیقت است» که در طراحی هوک اعمال شده،
-اینجا هم برای پیام کاربر (نه فقط پاسخ عامل) رعایت شده.
+Authorization is enforced **in code, never in prompts**. Every read or
+write of customer data flows through a single choke-point function per
+domain:
 
-### آنچه هنوز باقی مانده
+- `orders/services.py::orders_visible_to(user)`
+- `conversations/services.py::conversations_visible_to(user)`
+- `documents/views.py` (list = any user, upload/delete = support only)
 
-- شمارش دقیق token و نمایش هزینه‌ی هر گفت‌وگو در UI — بخش ۷.
-- پایپ‌لاین واقعی بارگذاری سند و صفحه‌ی «اسناد» مجزا — بخش ۵.
-- تأیید انسانی پیش از اجرای `create_refund_request` از داخل چت — بخش امتیازی،
-  عمداً پیاده‌سازی نشده (فرم مستقیم `RefundPanel` این نیاز را برای اکثر موارد پوشش
-  می‌دهد).
+The AI worker cannot import Django modules (it is not a Django app),
+so it re-implements the *same rule* in plain psycopg
+(`ai-worker/db.py::fetch_order_for_user` etc.). The identity used is
+always `acting_user_id` from the command envelope — resolved by
+Django from a verified JWT before the message ever reaches RabbitMQ.
+The LLM has **no argument slot** to say "act as user X".
 
-## بخش ۷ — رصدپذیری و هزینه
+**404, not 403:** a customer requesting another customer's order gets
+`404 Not Found`, not `403 Forbidden`, so the endpoint never leaks
+"this exists but is not yours".
 
-سند دو چیز می‌خواهد و این بخش دقیقاً همان دو چیز است:
+**Bonus RBAC:** users with role `support_agent` see any customer's
+orders and conversations. Same rule, one extra branch, greppable.
 
-> «ردهای اجرا برای کل اجرای عامل، هر فراخوانی مدل و ابزار، همه متصل با
-> `correlation_id`. هزینه هر گفت‌وگو را در رابط کاربری نشان دهید. API رایگان
-> است، اما «رایگان بود» پاسخ این پرسش نیست: token‌ها را واقعی بشمارید،
-> اعتبارهای Tavily را اضافه کنید.»
+---
 
-### ۱. معماری: Langfuse برای «خط زمانی»، PostgreSQL برای «دفتر حساب»
+## 4. Event-driven architecture
 
-دو مقصد جدا، عمداً:
+The course runs the agent inside a Django request. Relay does not:
+the web process publishes a **command** to RabbitMQ and returns
+`202 Accepted` immediately; the AI worker consumes it and publishes
+**events** back on a fanout exchange.
+
+### Command vs Event
+
+| | Command | Event |
+|---|---|---|
+| Meaning | "do this" | "this happened" |
+| Consumers | exactly one (ai-worker) | zero or more |
+| Route | queue `agent_commands` | fanout exchange `agent_events_exchange` |
+| Failure | retried with backoff, then DLQ | not retried; a missed UI update ≠ dropped work |
+
+**Commands:** `command.process_user_message`.
+
+**Events:** `agent_run_started`, `agent_response_chunk`,
+`agent_tool_called`, `agent_run_completed`, `agent_run_failed`,
+`agent_run_usage`.
+
+### One versioned envelope for both
+
+Defined in `messaging/envelope.py` (Django) and `ai-worker/envelope.py`
+(duplicated on purpose — two separate images, no shared package):
+
+```json
+{
+  "message_id":     "UUID (idempotency key)",
+  "correlation_id": "UUID (one per user interaction)",
+  "kind":           "command | event",
+  "message_type":   "e.g. command.process_user_message",
+  "schema_version": 1,
+  "occurred_at":    "ISO-8601 UTC",
+  "producer":       "backend | ai-worker",
+  "retry_count":    0,
+  "payload":        { "...": "..." }
+}
+```
+
+### Reliability
+
+- **Manual ack** with `basic_qos(prefetch_count=1)` — no auto-ack.
+- **Exponential backoff** using RabbitMQ's built-in Dead Letter
+  Exchange + per-queue TTL: three staged retry queues (1 s, 4 s,
+  16 s) that dead-letter back to `agent_commands` on expiry. After
+  the retry budget is spent, the message goes to `agent_commands.dlq`.
+- **Idempotency** in PostgreSQL: table `messaging_processedmessage`
+  with a `UNIQUE` on `message_id`. Two-layer check in the worker: a
+  cheap early `SELECT` short-circuits the common redelivery case; the
+  final `INSERT` closes the race between two concurrent deliveries.
+
+**Q: What if the same command arrives twice?**
+The early check makes redelivery a cheap no-op; if two deliveries
+race past it, the `UNIQUE` constraint on the final `INSERT` picks a
+winner and the loser acks without re-doing side effects.
+
+**Q: What if the worker crashes before ack?**
+Because ack is manual and sent last, RabbitMQ redelivers the message
+to another consumer (or to this one after restart). That redelivery
+is the "same command twice" case above.
+
+**Known limitation (explicit, not hidden):** RabbitMQ event publish
+and the idempotency-row `INSERT` are two separate systems and cannot
+be committed atomically without a transactional outbox (out of scope
+here). A crash *between* publishing events and writing the ledger
+row can cause a redelivery to re-run the agent and re-emit those
+events. The order (agent work first, `INSERT` last) shrinks — but
+does not eliminate — this window.
+
+### One correlation_id, six places
+
+`Conversation.correlation_id` is minted once when the conversation is
+first created and reused forever after. It appears — verbatim — in:
+the HTTP request, the RabbitMQ envelope, every SSE frame the browser
+receives, the worker's `[trace]` stdout lines, `AgentRun.correlation_id`
+in Postgres, and the Langfuse session tag.
+
+---
+
+## 5. The agent (LangGraph)
+
+One small `StateGraph`, two nodes in a loop:
+
+```
+    agent_node  ─┬─► tools_node ──► agent_node
+                 └─► END
+```
+
+Deliberately **one** well-built agent, not three cooperating agents:
+the brief scores depth, not agent count, and the "risk/fraud" split
+from the reference course does not fit this domain.
+
+### Four tools, three knowledge sources + one action
+
+| Tool | Kind | Input schema |
+|---|---|---|
+| `get_order_info` | structured internal (DB) | `order_id` (UUID) |
+| `search_knowledge_base` | unstructured internal (RAG) | `query` (str, 3–500) |
+| `web_search` | external (Tavily) | `query` (str, 3–500) |
+| `create_refund_request` | **action** (writes) | `order_id`, `reason` |
+
+**Guardrails required by the brief:**
+
+- Every tool has a **narrow Pydantic input schema**
+  (`tools/schemas.py`) — the model can never build an arbitrary SQL
+  query; the only "search" tools take a string because a search
+  genuinely is one.
+- Tools that touch customer data (`get_order_info`,
+  `create_refund_request`) are **closures over `acting_user_id`**
+  built fresh per run, so the identity comes from the verified JWT,
+  never from an LLM-supplied argument.
+- The graph runs with `recursion_limit=8`, so one confused run
+  cannot burn the LLM budget.
+- Checkpointer is `MemorySaver`, not Postgres — conversation history
+  is reconstructed from `conversations.Message` before every run; the
+  graph state itself only needs to live for one `graph.stream()` call.
+
+### Timeout backstop
+
+`worker.py` runs the graph on a background thread with a 45 s
+wall-clock ceiling. A provider SDK that ignores its own timeout (yes,
+this has been observed) would otherwise block the single-prefetch
+worker forever — a silent full outage instead of an `AGENT_RUN_FAILED`
+routed through the normal retry/DLQ path.
+
+### Bonus: automatic fallback to a second model
+
+`llm/factory.py::bind_tools_with_fallback` binds the tools to
+**both** the primary and fallback models and only then wraps them
+with `.with_fallbacks()`. This order is not decorative:
+`RunnableWithFallbacks` has no `bind_tools`, so wrapping first would
+crash — but only once a fallback is actually configured, which is
+the worst kind of latency. Binding to both models also prevents a
+failover from silently answering from memory without tools (which
+the brief calls "worse than a wrong answer").
+
+---
+
+## 6. RAG
+
+Full pipeline from upload to retrieval:
+
+1. `POST /api/documents/` (support agent only) uploads a text file.
+2. `documents/services.py` chunks it (800 chars, 100 overlap),
+   embeds each chunk with ChromaDB's default embedding function,
+   stores it in collection `company_documents` with metadata:
+   `document_id`, `document_title`, `chunk_index`, `source =
+   "internal_document"`.
+3. The worker's `search_knowledge_base` tool queries the same
+   collection and returns the matching chunks.
+
+Every RAG result carries `"source": "internal_document"` and every
+web-search result carries `"source": "web"` — the frontend renders
+them with different labels and colors so an internal-document
+citation can **never** look like a web citation (a specific
+requirement of the brief).
+
+---
+
+## 7. Live streaming (SSE)
+
+The SSE view (`streaming/views.py::conversation_stream`) is an async
+ASGI endpoint. Each connection:
+
+- **Authenticates first** — the JWT travels as a query parameter
+  (`?token=...`) because `EventSource` cannot set headers. This is
+  the *only* endpoint that accepts JWTs from a query string.
+- Declares its **own** `exclusive`, `auto_delete` queue bound to the
+  events exchange — "each connection has its own short-lived
+  subscription" enforced at the broker, not by convention.
+- **Filters by `correlation_id`** in the view (the exchange is
+  fanout, so every subscriber receives every event).
+- Sends a heartbeat every 15 s so proxies do not close an idle
+  connection and the frontend can tell "quiet but alive" from "dead".
+
+**Delta buffering:** `agent_response_chunk` events carry ~40 chars
+at a time, not one event per token — direct requirement of the
+brief.
+
+### The stream ↔ system-of-record boundary
+
+*If the stream drops mid-generation, what does the user ultimately
+see?* — **the database, not the stream.** On every reconnect the
+frontend's `useConversationStream` hook re-fetches
+`GET /api/conversations/<id>/messages/` and only then resumes
+listening. The final assistant text (plus its `tool_calls_json`
+trace) is written by the worker to `conversations_message` before
+`agent_run_completed` fires; the SSE stream is a live relay, not the
+truth.
+
+### Four connection states, always visible
+
+`connecting | connected | reconnecting | failed` are derived from
+real `EventSource` events (`stream.connected` frame, `onerror`) and
+shown as a badge in the chat panel. On any drop, the hook manages
+its own reconnect with exponential backoff (1, 2, 4, 8 s, cap 10 s;
+6 attempts, then `failed` with a manual **Retry** button). Silent
+stalls after a broken stream would be a failure by the brief's
+definition.
+
+---
+
+## 8. Observability & cost
+
+Two destinations, on purpose:
 
 | | Langfuse | PostgreSQL (`observability_*`) |
 |---|---|---|
-| چه چیزی | خط زمانی کامل یک اجرا برای دیباگ | دفتر حسابِ توکن و هزینه |
-| چه کسی می‌خواند | توسعه‌دهنده، در مرورگر Langfuse | خودِ محصول — پنل هزینه در UI |
-| اگر نباشد | چیزی از کار نمی‌افتد | UI هزینه‌ای برای نمایش ندارد |
-| اختیاری؟ | بله (کلید نباشد، غیرفعال می‌شود) | خیر |
+| Purpose | full timeline per run, for debugging | ledger the UI reads |
+| Read by | developer, in the browser | the product itself (UsagePanel) |
+| Optional? | yes (no keys = disabled) | no |
 
-دلیل این جدایی ساده است: نمایش هزینه در UI نباید به در دسترس بودن یک سرویس
-SaaS شخص ثالث وابسته باشد، و دفاع روی لپ‌تاپِ بدون اینترنت هم باید بخش ۷ را
-برآورده کند. هر دو مقصد با **همان** `correlation_id` کلید می‌خورند.
+Both are keyed by the same `correlation_id`. The UI must work with
+zero SaaS dependencies (e.g. on a laptop with no internet), so the
+cost display is backed by Postgres, not Langfuse.
 
-### ۲. رد اجرا از کجا می‌آید — از داخل LangChain، نه از حدس ما
+### Execution trace
 
-`ai-worker/observability/tracing.py::RunTracer` یک `BaseCallbackHandler` است که
-در `graph_config["callbacks"]` به گراف داده می‌شود. یعنی رد اجرا با **مشاهده‌ی**
-اجرای واقعی ساخته می‌شود، نه با این‌که ما یادمان باشد جایی log بزنیم. چیزهایی که
-فقط از این نقطه دیده می‌شوند و از روی جریان رویدادها (`worker.py`) قابل
-بازسازی نبودند:
+`ai-worker/observability/tracing.py::RunTracer` is a LangChain
+`BaseCallbackHandler` passed to the graph via
+`graph.stream(..., config={"callbacks": [...]})`. This means every
+model call and every tool call is observed **from inside LangChain**,
+not guessed from our event loop — including a model call whose only
+output is a `tool_call` (which streams no user-visible text) and a
+tool that raises rather than returns an error-shaped string.
 
-- مدت هر فراخوانی مدل، جدا از مدت ابزارهای بین آن‌ها؛
-- تعداد توکن هر فراخوانی مدل؛
-- فراخوانی‌هایی از مدل که هیچ متنی تولید نمی‌کنند (نوبتی که خروجی‌اش فقط یک
-  tool call است، هیچ `delta`‌ای استریم نمی‌کند)؛
-- خطای *داخل* ابزار، در برابر ابزاری که رشته‌ای برمی‌گرداند که اتفاقاً خطا را
-  توصیف می‌کند.
-
-خروجی: برای هر اجرا یک ردیف `AgentRun` و برای هر فراخوانی مدل/ابزار یک ردیف
-`RunSpan` با `sequence` — که مسیر تصمیم عامل را به‌ترتیب بازپخش می‌کند
+Output: one `AgentRun` row per run (also for failed and timed-out
+runs — they spent tokens too) and one `RunSpan` row per model/tool
+call, replaying the agent's decision path
 (`llm → tool → llm → tool → llm`).
 
-### ۳. اتصال همه‌چیز با `correlation_id`
+### Real token counting, honestly labeled
 
-یک شناسه، در هر شش جا:
+Priority in `on_llm_end`:
 
-```
-POST /api/support/messages/           →  Conversation.correlation_id (پایدار، بخش ۴)
-envelope (RabbitMQ command/event)     →  همان id
-frame‌های SSE در مرورگر                →  همان id
-observability_agentrun.correlation_id →  همان id
-خطوط [trace] در stdout ورکر            →  همان id
-Langfuse: session_id + tag            →  همان id
-```
+1. `usage_metadata` on the returned message — provider-reported. **Exact.**
+2. `llm_output["token_usage"]` — same thing, OpenAI shape. **Exact.**
+3. Local byte-length estimate — **labeled `estimated`**, all the way
+   to the UI badge.
 
-در دفاع: یک `correlation_id` را از DevTools مرورگر بردارید و همان رشته را در
-`docker compose logs ai-worker`، در RabbitMQ management UI، در جدول
-`observability_agentrun` و در جست‌وجوی Langfuse پیدا کنید.
+`llm/factory.py` sends `stream_options: {"include_usage": true}`
+so step 1 fires even on streaming responses. Providers that reject
+that field can turn it off with `LLM_STREAM_USAGE=0` — the ledger
+still works, only the precision label changes.
 
-### ۴. شمارش «واقعی» توکن — و صادق‌بودن درباره‌ی وقتی که واقعی نیست
+### Cost figure
 
-ترتیب اولویت در `RunTracer.on_llm_end`:
+The number the UI shows is a **reference cost**: real token counts
+priced against the model's published list price. This is what the
+same traffic would cost outside the free tier — the honest answer
+the brief demands instead of "it was free". Prices are a small table
+in `observability/pricing.py`, fully overridable from `.env`.
 
-1. `usage_metadata` روی پیام بازگشتی — شمارش خودِ ارائه‌دهنده. **دقیق**.
-2. `llm_output["token_usage"]` — همان چیز، با شکل OpenAI. **دقیق**.
-3. تخمین محلی از طول بایتی متن (`estimate_tokens`) — **تخمین**.
+**Tavily is priced in credits**, not tokens (1 per basic search,
+2 per advanced), so `tavily_credits` is a separate column and a
+separate line item in the UI — a search that never reached Tavily
+(missing key, HTTP failure) records zero credits, not one.
 
-حالت ۳ با برچسب `estimated` ثبت می‌شود و این برچسب تا خودِ UI می‌آید. چرا این
-مهم است: بعضی endpointهای رایگانِ سازگار با OpenAI هنگام streaming اصلاً بلوک
-usage برنمی‌گردانند، و نمایش‌دادن یک تخمین محلی به‌عنوان اندازه‌گیریِ
-ارائه‌دهنده دقیقاً همان پاسخ راحتی است که سند رد می‌کند.
+### One endpoint, RBAC-shaped
 
-گام ۳ عمداً حساب‌وکتاب ساده است، نه توکنایزر واقعی. اول `tiktoken` را گذاشته
-بودم و بعد حذفش کردم، به سه دلیل:
+`GET /api/conversations/<uuid>/usage/` — owner (or any support
+agent). A support agent sees the full ledger; a customer sees only
+the three headline totals (`run_count`, `total_tokens`,
+`total_cost_usd`), redacted server-side before the response leaves
+Django.
 
-- واژگان `cl100k_base` توکنایزرِ مدل این پروژه **نیست** — یعنی در بهترین حالت هم
-  تخمین بود، فقط تخمینی گران‌تر.
-- `tiktoken.get_encoding()` واژگانش را در اولین استفاده **از شبکه دانلود می‌کند**،
-  بدون timeoutی که این کد کنترلش کند، از داخل یک callback روی مسیر داغ ورکر. این
-  همان دسته خطری است که `AGENT_RUN_TIMEOUT_SECONDS` برای مهارش نوشته شده. در
-  کانتینری بدون اینترنت خروجی، صریحاً شکست می‌خورد.
-- این مسیر فقط وقتی اجرا می‌شود که ارائه‌دهنده هیچ usageای ندهد — و با
-  `stream_usage=True` روی این استقرار چنین چیزی رخ نمی‌دهد. پس هزینه‌ی وابستگی
-  چیزی نمی‌خرید.
+---
 
-هزینه‌ی این حذف که باید صادقانه گفته شود: `bytes/4` فارسی را کم‌شمار می‌کند. ولی
-این فقط روی مسیر پشتیبان اثر دارد و UI هم همان‌جا badge نارنجی «تخمین محلی» را
-نشان می‌دهد، نه عدد دقیق.
+## 9. Frontend
 
-برای این‌که حالت ۱ بیشتر اتفاق بیفتد، `llm/factory.py` حالا `stream_usage=True`
-می‌فرستد (یعنی `stream_options: {"include_usage": true}` روی سیم). چند
-ارائه‌دهنده این فیلد ناشناخته را رد می‌کنند، پس با `LLM_STREAM_USAGE=0` قابل
-خاموش‌کردن است؛ دفتر حساب در هر دو حالت کار می‌کند، فقط برچسب دقتش عوض می‌شود.
+Three pages, as the brief specifies (Login, Chat, Documents), plus a
+list of orders. Visual polish is not scored; connection states and
+citation clarity are. No routing library — one `selectedOrderId` in
+`App.tsx` is enough for three pages.
 
-### ۵. هزینه: چه عددی نشان داده می‌شود و چرا
+- `ChatPanel.tsx` — messages (from DB) + live turn (from stream),
+  connection badge, live tool-activity panel, source-labeled result
+  badges (internal doc = blue, web = orange, DB = green, action = purple).
+- `RefundPanel.tsx` — direct REST path, independent of the chat
+  agent. Both paths land on the same `orders/services.py`
+  authorization check.
+- `UsagePanel.tsx` — reference cost with "based on list prices" label,
+  provider vs estimated badge, Tavily credit count, per-run span
+  breakdown.
+- `useConversationStream.ts` — owns the boundary described in §7.
 
-عددی که UI نشان می‌دهد **هزینه‌ی مرجع** است: همین ترافیک، با همین توکن‌های
-واقعاً شمرده‌شده، روی نرخ‌نامه‌ی منتشرشده‌ی همان مدل چقدر می‌شد. این عدد معنا
-دارد چون متناسب با مصرف واقعی منابع است (وقتی عامل بیشتر حلقه بزند یا prompt
-بزرگ‌تر شود بالا می‌رود) و همان چیزی است که روزِ تمام‌شدن پلن رایگان پرداخت
-می‌شود. UI آن را صراحتاً «بر پایه‌ی نرخ‌نامه» برچسب می‌زند — نه صورت‌حساب.
+---
 
-نرخ‌ها در `ai-worker/observability/pricing.py` یک جدول کوتاه‌اند و همه‌شان از
-`.env` قابل override هستند (`LLM_PRICE_TABLE_JSON`, `LLM_DEFAULT_PRICE_*`).
-هر span ثبت می‌کند که قیمتش از جدول آمده (`price_source: "table:gpt-4o-mini"`)
-یا از fallback (`"default"`).
-
-**اعتبارهای Tavily جدا شمرده می‌شوند.** Tavily توکن نمی‌فروشد، credit
-می‌فروشد: ۱ برای جست‌وجوی basic، ۲ برای advanced. پس `tavily_credits` یک ستون
-مستقل است و در UI هم به‌صورت شمارش خودش نمایش داده می‌شود (نه قاطی‌شده در
-ریاضیِ توکن، جایی که نامرئی می‌شد). جست‌وجویی که اصلاً به Tavily نرسیده — کلید
-تنظیم نشده یا HTTP شکست خورده — صفر credit ثبت می‌کند، نه یک؛ منطقش در
-`_tavily_credits_for_result` است.
-
-هزینه‌ی embedding صفر است: ChromaDB با embedding function پیش‌فرض و محلی خودش
-کار می‌کند و هیچ API خارجی صدا زده نمی‌شود.
-
-### ۶. اجراهای ناموفق هم حساب می‌شوند
-
-`_record_run` داخل یک `finally` صدا زده می‌شود. اجرایی که سه بار مدل را صدا زده
-و بعد به سقف زمانی خورده، دقیقاً به‌اندازه‌ی یک اجرای موفق توکن سوزانده است؛
-دفتر حسابی که فقط موفق‌ها را بشمارد عددی کمتر از صورت‌حساب واقعی گزارش می‌کند.
-به همین دلیل:
-
-- قید یکتایی `(command_message_id, attempt)` است، نه فقط `command_message_id` —
-  هر **تلاش مجدد** (backoff بخش ۳) ردیف خودش را دارد، چون واقعاً دوباره خرج کرده؛
-- `summarize()` هزینه‌ی اجراهای `failed` را در مجموع می‌آورد و تعدادشان را هم
-  جداگانه نشان می‌دهد؛
-- span‌هایی که هنگام timeout هنوز باز بوده‌اند با وضعیت `incomplete` بسته
-  می‌شوند، تا رد اجرا نشان دهد دقیقاً کجا قطع شده، نه این‌که آن گام ناپدید شود.
-
-یک تحویلِ تکراری که early idempotency check آن را رد می‌کند هیچ چیز خرج
-نمی‌کند و هیچ ردیفی هم نمی‌نویسد.
-
-### ۷. رویداد جدید و مسیر UI
-
-یک نوع رویداد به فهرست رویدادهای بخش ۳ اضافه شد:
-
-| رویداد | چه وقت | payload |
-|---|---|---|
-| `event.agent_run_usage` | یک بار در پایان **هر** اجرا (موفق یا ناموفق) | توکن‌ها، credit‌های Tavily، هزینه، مدت، فهرست span‌ها، `trace_url` |
-
-اما UI این عدد را مستقیم نمی‌نشاند. همان مرز بخش ۶ اینجا هم رعایت شده:
-**جریان می‌گوید «کِی»، دیتابیس می‌گوید «چه»**. هوک با دیدن این رویداد فقط
-`usageVersion` را یک واحد جلو می‌برد، و `UsagePanel` با تغییر آن دوباره
-`GET /api/conversations/<id>/usage/` را می‌خواند. نتیجه: تبی که وسط سه نوبت قطع
-بوده، به‌محض برگشت مجموع درست را می‌بیند، نه جمعِ رویدادهایی که تصادفاً گرفته.
-
-### ۸. اندپوینت‌ها و مجوزدهی
-
-| متد | مسیر | چه کسی |
-|---|---|---|
-| GET | `/api/conversations/<uuid>/usage/` | صاحب گفت‌وگو؛ یا هر پشتیبان |
-
-یکی، نه دو تا. یک اندپوینت «مجموع کل سامانه» هم نوشته بودم و بعد حذفش کردم: سند
-هزینه‌ی **هر گفت‌وگو** را می‌خواهد، هیچ‌جای رابط کاربری آن یکی را صدا نمی‌زد، و
-اندپوینتی که caller ندارد اندپوینتی است که مجوزدهی‌اش را کسی بررسی نمی‌کند.
-
-داده‌ی هزینه، داده‌ی مشتری است. پس هیچ view‌ای مستقیم `AgentRun.objects` را صدا
-نمی‌زند؛ همه از `observability/services.py` رد می‌شوند که خودش از
-`conversations/services.py` — همان تنها نقطه‌ی مجوزدهی — عبور می‌کند. همان
-قرارداد «۴۰۴، نه ۴۰۳» حفظ شده. هیچ اندپوینت **نوشتنی** وجود ندارد: ردیف‌ها را
-همان پروسه‌ای می‌نویسد که واقعاً توکن خرج کرده.
-
-### ۹. پنل UI (`frontend/src/components/UsagePanel.tsx`)
-
-زیر همان چتی که توصیفش می‌کند، و عمداً فقط یک عدد نیست:
-
-1. هزینه‌ی مرجع (با برچسب صریحِ «بر پایه‌ی نرخ‌نامه»)؛
-2. توکن‌های واقعی پشت آن عدد، به‌همراه badge «شمارش دقیق ارائه‌دهنده» یا
-   «تخمین محلی / ترکیبی»؛
-3. اعتبارهای Tavily، با واحد خودشان؛
-4. رد اجرای هر نوبت: هر فراخوانی مدل و ابزار به‌ترتیب، با مدت و توکن و هزینه،
-   کنارش `correlation_id` و (اگر Langfuse تنظیم باشد) لینک مستقیم به رد کامل.
-
-مبالغ کمتر از یک سنت با ۶ رقم اعشار نشان داده می‌شوند، نه گردشده به `$0.00` —
-گردکردن دقیقاً همان برداشت «رایگان بود» را می‌ساخت که سند رد می‌کند.
-
-### ۱۰. فایل‌های این بخش
+## 10. Layout
 
 ```
-backend/observability/          # (جدید) مدل‌ها، سرویس مجوزدهی/تجمیع، اندپوینت‌ها، admin، تست
-ai-worker/observability/        # (جدید) pricing.py، tracing.py، langfuse_client.py
-ai-worker/worker.py             # run_agent حالا wrapper رصدپذیری است؛ کار قبلی در _execute_agent_run
-ai-worker/db.py                 # + insert_agent_run (نوشتن دفتر حساب با SQL خام)
-ai-worker/llm/factory.py        # + stream_usage برای شمارش توکنِ ارائه‌دهنده
-*/envelope.py                   # + AGENT_RUN_USAGE
-frontend/src/components/UsagePanel.tsx       # (جدید)
-frontend/src/api/observability.ts            # (جدید)
-frontend/src/hooks/useConversationStream.ts  # + usageVersion
+backend/
+  accounts/         # custom user model + roles + JWT permissions
+  orders/           # Order, Product, RefundRequest + services.py (auth choke-point)
+  conversations/    # Conversation, Message + services.py
+  documents/        # upload/indexing pipeline for RAG
+  messaging/        # envelope, topology, publisher, ProcessedMessage
+  streaming/        # ASGI SSE view
+  support/          # POST /api/support/messages/ (publish command)
+  observability/    # AgentRun/RunSpan models + read-only endpoints
+
+ai-worker/
+  worker.py                    # command handler, retry/DLQ, timeout backstop
+  envelope.py, topology.py     # duplicated on purpose (two images)
+  events.py                    # publish events to the fanout exchange
+  db.py                        # plain psycopg — idempotency + auth-scoped reads
+  graph/agent_graph.py         # the LangGraph agent (2 nodes, 4 tools)
+  tools/                       # get_order_info, search_knowledge_base,
+                               # web_search, create_refund_request
+  llm/factory.py               # provider-agnostic model + fallback chain
+  observability/               # RunTracer, pricing table, Langfuse handler
+
+frontend/src/
+  pages/             # Login, Orders, OrderDetail, Documents
+  components/        # ChatPanel, RefundPanel, UsagePanel
+  hooks/             # useConversationStream (SSE lifecycle)
+  api/               # thin fetch wrappers
 ```
 
-### ساده‌سازی عمدی: چه چیزی حذف شد و چرا
+---
 
-بعد از کارکردن این بخش، یک دور اندازه‌گیری و کوتاه‌سازی روی آن انجام شد. معیار:
-**فقط آنچه سند می‌خواهد، به‌علاوه‌ی آنچه واقعاً لازم است — و بدون هیچ تغییر رفتاری.**
+## 11. Notable non-goals
 
-| حذف‌شده | چرا | چند خط |
-|---|---|---|
-| اندپوینت `observability/summary/` + سرویس و تستش | سند «هزینه هر گفت‌وگو» می‌خواهد، نه داشبورد کل؛ هیچ‌کس صدایش نمی‌زد | ~۵۰ |
-| `RunTracer.on_llm_start` | فقط برای مدل‌های غیرچت صدا زده می‌شود و `factory.py` فقط chat model می‌سازد — کد مرده | ۲۵ |
-| فهرست دستی فیلدها در سه تابع serialize | با `dataclasses.fields()` جایگزین شد؛ خروجی **بایت‌به‌بایت** یکسان | ~۳۰ |
+The following bonus items are **not implemented**:
 
-مورد سوم با یک golden snapshot بررسی شد: خروجی `to_dict` / `to_event_dict` /
-`to_event_payload` قبل و بعد از refactor گرفته و `diff` شد — یکسان، از جمله ترتیب
-کلیدها. مزیت جانبی‌اش این است که حالا **تعریف dataclass خودش فهرست فیلدهاست**، پس
-اضافه‌کردن یک ستون دیگر نمی‌تواند بی‌صدا به دیتابیس نرسد.
-
-یک مورد را عمداً **انجام ندادم**: `_messages_to_text` (پیمایش بازگشتی، ۲۲ خط).
-می‌شد کوتاهش کرد، ولی نه به‌شکلی که ثابت شود خروجی‌اش برای هر ورودی یکسان می‌ماند
-(مثلاً `None` یا رشته‌ی خالی داخل لیست، تعداد `
-` را عوض می‌کند و در نتیجه تخمین
-توکن را). «رفتار تغییر نکند» بر «۱۰ خط کمتر» اولویت داشت.
-
-چیزهایی که **قابل حذف نبودند** چون سند صریحاً خواسته: جدول `RunSpan` (چون «هر
-فراخوانی مدل و ابزار» می‌خواهد)، شمردن جدای اعتبار Tavily، حساب‌کردن اجراهای
-ناموفق، و ردیف مستقل برای هر تلاش مجدد.
-
-### محدودیت‌های شناخته‌شده‌ی این بخش
-
-- **نوشتن دفتر حساب اتمیک نیست.** `insert_agent_run` بعد از اجرای عامل و در یک
-  تراکنش جدا اجرا می‌شود؛ همان محدودیتِ «RabbitMQ و PostgreSQL دو سیستم‌اند» که
-  در بخش ۳ مستند شده. اگر ورکر دقیقاً بین پایان اجرا و نوشتن این ردیف کرش کند،
-  آن اجرا در دفتر حساب ثبت نمی‌شود. عمداً هم همین ترتیب انتخاب شده: یک خطای
-  حسابداری نباید یک پاسخ موفق را خراب کند، پس `insert_agent_run` هیچ‌وقت
-  exception بالا نمی‌دهد.
-- **توکن‌های یک فراخوانی مدلِ ناموفق شمرده نمی‌شوند.** ارائه‌دهنده در خطا usage
-  برنمی‌گرداند و ما هم عدد نمی‌سازیم؛ span با وضعیت `error` و صفر توکن ثبت
-  می‌شود تا معلوم باشد چرا عدد نیست.
-- **جدول قیمت کهنه می‌شود.** برای همین کاملاً از `.env` قابل override است و هر
-  span منبع قیمتش را ثبت می‌کند.
-- **هزینه‌ی فراخوانی‌هایی که خارج از گراف اتفاق بیفتد شمرده نمی‌شود.** امروز
-  چنین فراخوانی‌ای وجود ندارد (همه‌ی کار مدل داخل گراف است)، اما این یک فرض
-  است، نه یک تضمین ساختاری.
+- Human confirmation before a destructive tool call.
+- Hybrid full-text + vector search.
+- Feedback loop back into an evaluation set.
+- OpenAPI auto-generation from DRF.
+- LLM-as-judge evaluation.
