@@ -7,6 +7,24 @@ import type { ChatMessage, StreamConnectionState, ToolCallRecord } from "../type
 interface ChatPanelProps {
   conversationId: string;
   correlationId: string;
+  /**
+   * When true, the composer is hidden and no messages can be sent from
+   * this panel. Admins (support agents) viewing a customer's order use
+   * this mode: they can read the full conversation and the token/cost
+   * ledger, but they must not impersonate the customer by chatting on
+   * their behalf.
+   */
+  readOnly?: boolean;
+  /**
+   * When true, per-tool activity (live "calling X..." indicators and
+   * the collapsible JSON tool-result badges under each assistant
+   * message) is rendered. Only enabled for support agents (role-based
+   * UI), matching the same RBAC boundary the backend already enforces
+   * on document uploads. Customers get a clean answer without the
+   * operator-side noise; the events still flow, we just don't render
+   * them.
+   */
+  showToolDetails?: boolean;
 }
 
 /**
@@ -102,22 +120,35 @@ function ToolResultBadge({ call }: { call: ToolCallRecord }) {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({
+  message,
+  showToolDetails,
+}: {
+  message: ChatMessage;
+  showToolDetails: boolean;
+}) {
   return (
     <div className={`chat-bubble chat-bubble--${message.role}`}>
       <div className="chat-bubble-content">{message.content}</div>
-      {message.tool_calls_json && message.tool_calls_json.length > 0 && (
-        <div className="chat-bubble-tools">
-          {message.tool_calls_json.map((call) => (
-            <ToolResultBadge key={call.tool_call_id} call={call} />
-          ))}
-        </div>
-      )}
+      {showToolDetails &&
+        message.tool_calls_json &&
+        message.tool_calls_json.length > 0 && (
+          <div className="chat-bubble-tools">
+            {message.tool_calls_json.map((call) => (
+              <ToolResultBadge key={call.tool_call_id} call={call} />
+            ))}
+          </div>
+        )}
     </div>
   );
 }
 
-export default function ChatPanel({ conversationId, correlationId }: ChatPanelProps) {
+export default function ChatPanel({
+  conversationId,
+  correlationId,
+  readOnly = false,
+  showToolDetails = false,
+}: ChatPanelProps) {
   const {
     messages,
     liveTurn,
@@ -176,7 +207,7 @@ export default function ChatPanel({ conversationId, correlationId }: ChatPanelPr
   return (
     <div className="chat-panel">
       <div className="chat-panel-header">
-        <h3>گفت‌وگو با پشتیبانی</h3>
+        <h3>{readOnly ? "گفت‌وگو با پشتیبانی (فقط مشاهده)" : "گفت‌وگو با پشتیبانی"}</h3>
         <ConnectionBadge state={connectionState} onRetry={reconnect} />
       </div>
 
@@ -190,12 +221,16 @@ export default function ChatPanel({ conversationId, correlationId }: ChatPanelPr
         )}
 
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble
+            key={message.id}
+            message={message}
+            showToolDetails={showToolDetails}
+          />
         ))}
 
         {(liveTurn || awaitingResponse) && (
           <div className="chat-bubble chat-bubble--assistant chat-bubble--live">
-            {liveTurn && liveTurn.toolActivity.length > 0 && (
+            {showToolDetails && liveTurn && liveTurn.toolActivity.length > 0 && (
               <div className="live-activity">
                 {liveTurn.toolActivity.map((activity) => (
                   <div key={activity.tool_call_id} className="live-activity-item">
@@ -218,25 +253,37 @@ export default function ChatPanel({ conversationId, correlationId }: ChatPanelPr
         <div ref={scrollAnchorRef} />
       </div>
 
-      <form className="chat-composer" onSubmit={handleSubmit}>
-        <input
-          type="text"
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder="پیام خود را بنویسید..."
-          disabled={composerLocked}
-        />
-        <button type="submit" disabled={composerLocked || !draft.trim()}>
-          {sending ? "در حال ارسال..." : awaitingResponse ? "در انتظار پاسخ..." : "ارسال"}
-        </button>
-      </form>
-      {sendError && <p className="form-error">{sendError}</p>}
+      {readOnly ? (
+        <p className="muted chat-readonly-note">
+          شما به‌عنوان ادمین در حال مشاهده‌ی این گفت‌وگو هستید.
+        </p>
+      ) : (
+        <>
+          <form className="chat-composer" onSubmit={handleSubmit}>
+            <input
+              type="text"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="پیام خود را بنویسید..."
+              disabled={composerLocked}
+            />
+            <button type="submit" disabled={composerLocked || !draft.trim()}>
+              {sending ? "در حال ارسال..." : awaitingResponse ? "در انتظار پاسخ..." : "ارسال"}
+            </button>
+          </form>
+          {sendError && <p className="form-error">{sendError}</p>}
+        </>
+      )}
 
       {/* Part 7: the cost/trace panel sits directly under the chat it
           describes, and re-reads the ledger from the database every
           time `usageVersion` moves (i.e. whenever a run finishes,
           successfully or not). */}
-      <UsagePanel conversationId={conversationId} refreshToken={usageVersion} />
+      <UsagePanel
+        conversationId={conversationId}
+        refreshToken={usageVersion}
+        showDetails={showToolDetails}
+      />
     </div>
   );
 }

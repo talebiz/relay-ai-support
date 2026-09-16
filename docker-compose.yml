@@ -62,6 +62,11 @@ services:
       - "18080:8000"
     volumes:
       - ./backend:/app
+      # ChromaDB's default embedding function is client-side ONNX and
+      # downloads ~80MB of model files on first use. Without a
+      # persistent cache, every container recreation stalls the first
+      # upload for many minutes on the download.
+      - backend_model_cache:/root/.cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -109,3 +114,4 @@ volumes:
   chromadb_data:
   chroma_cache:
   worker_model_cache:
+  backend_model_cache:

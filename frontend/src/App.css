@@ -546,8 +546,17 @@
   cursor: pointer;
 }
 
-.usage-panel-toggle:hover {
+.usage-panel-toggle:hover:not(:disabled) {
   background: rgba(0, 0, 0, 0.03);
+}
+
+/* Customer view: the toggle exists so the headline (cost + tokens)
+   stays visible, but no body to open — so it must not look
+   click-inviting. Override the browser's grey disabled styling. */
+.usage-panel-toggle:disabled {
+  cursor: default;
+  opacity: 1;
+  color: inherit;
 }
 
 .usage-caret {

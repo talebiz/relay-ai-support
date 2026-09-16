@@ -11,6 +11,16 @@ interface UsagePanelProps {
    * the message list.
    */
   refreshToken: number;
+  /**
+   * When true (admin/support agent), the panel is expandable and the
+   * per-run trace, token breakdown, span list and Langfuse link are
+   * all reachable. When false (customer), only the collapsed headline
+   * remains: turn count, total tokens, total cost - the one thing
+   * section 7 of the brief requires be visible, and nothing more.
+   * The body is never mounted in that mode, so operator-side data
+   * (correlation ids, model names, per-span JSON) can't leak.
+   */
+  showDetails?: boolean;
 }
 
 /**
@@ -218,7 +228,11 @@ function UsageBody({ usage }: { usage: ConversationUsage }) {
   );
 }
 
-export default function UsagePanel({ conversationId, refreshToken }: UsagePanelProps) {
+export default function UsagePanel({
+  conversationId,
+  refreshToken,
+  showDetails = false,
+}: UsagePanelProps) {
   const [usage, setUsage] = useState<ConversationUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -250,18 +264,23 @@ export default function UsagePanel({ conversationId, refreshToken }: UsagePanelP
   if (error) headline = "—";
   else if (usage) headline = formatUsd(usage.totals.total_cost_usd);
 
+  const isOpen = showDetails && expanded;
+
   return (
-    <section className={`usage-panel ${expanded ? "usage-panel--open" : ""}`}>
+    <section className={`usage-panel ${isOpen ? "usage-panel--open" : ""}`}>
       <button
         type="button"
         className="usage-panel-toggle"
-        onClick={() => setExpanded((open) => !open)}
-        aria-expanded={expanded}
-        aria-controls="usage-panel-body"
+        onClick={showDetails ? () => setExpanded((open) => !open) : undefined}
+        aria-expanded={showDetails ? isOpen : undefined}
+        aria-controls={showDetails ? "usage-panel-body" : undefined}
+        disabled={!showDetails}
       >
-        <span className="usage-caret" aria-hidden="true">
-          ▾
-        </span>
+        {showDetails && (
+          <span className="usage-caret" aria-hidden="true">
+            ▾
+          </span>
+        )}
         <span className="usage-panel-title">هزینه و رد اجرا</span>
         {usage && usage.totals.run_count > 0 && (
           <span className="usage-panel-hint">
@@ -271,7 +290,7 @@ export default function UsagePanel({ conversationId, refreshToken }: UsagePanelP
         <span className="usage-total">{headline}</span>
       </button>
 
-      {expanded && (
+      {isOpen && (
         <div className="usage-panel-body" id="usage-panel-body">
           {error && <p className="form-error">{error}</p>}
           {!error && !usage && <p className="muted">در حال بارگذاری...</p>}

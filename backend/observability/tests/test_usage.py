@@ -116,17 +116,41 @@ def make_run(
 
 
 @pytest.mark.django_db
-def test_owner_can_read_own_conversation_usage(alice, alice_conversation):
-    make_run(alice_conversation)
+def test_owner_customer_gets_redacted_usage_payload(alice, alice_conversation):
+    """
+    A customer's own conversation still returns 200, but the payload is
+    stripped to the three headline fields the customer UI renders. Per-
+    run data and every non-headline total are zeroed BEFORE they leave
+    the server, so DevTools cannot reveal what the panel hides.
+    """
+    make_run(alice_conversation, input_tokens=100, output_tokens=50, llm_cost="0.000030")
     client = APIClient()
     client.force_authenticate(user=alice)
 
     resp = client.get(f"/api/conversations/{alice_conversation.id}/usage/")
 
     assert resp.status_code == 200
-    assert resp.data["totals"]["run_count"] == 1
-    assert len(resp.data["runs"]) == 1
-    assert len(resp.data["runs"][0]["spans"]) == 1
+    totals = resp.data["totals"]
+    # The three the customer UI actually renders survive verbatim.
+    assert totals["run_count"] == 1
+    assert totals["total_tokens"] == 150
+    assert Decimal(totals["total_cost_usd"]) == Decimal("0.000030")
+    # Everything else is zeroed / anonymized.
+    for key in (
+        "failed_run_count",
+        "llm_call_count",
+        "tool_call_count",
+        "input_tokens",
+        "output_tokens",
+        "tavily_credits",
+        "total_duration_ms",
+    ):
+        assert totals[key] == 0, key
+    for key in ("llm_cost_usd", "tavily_cost_usd"):
+        assert Decimal(totals[key]) == Decimal("0"), key
+    assert totals["token_source"] == "none"
+    # No per-run rows for a customer.
+    assert resp.data["runs"] == []
 
 
 @pytest.mark.django_db
@@ -141,14 +165,26 @@ def test_usage_endpoint_404s_for_other_users_conversation(alice, bob_conversatio
 
 
 @pytest.mark.django_db
-def test_support_agent_can_read_any_conversation_usage(support_agent, bob_conversation):
-    make_run(bob_conversation)
+def test_support_agent_receives_full_usage_payload(support_agent, bob_conversation):
+    """
+    The admin/operator view: full totals AND every run with its spans,
+    including correlation ids and per-span costs.
+    """
+    make_run(bob_conversation, llm_cost="0.000030")
     client = APIClient()
     client.force_authenticate(user=support_agent)
 
     resp = client.get(f"/api/conversations/{bob_conversation.id}/usage/")
 
     assert resp.status_code == 200
+    totals = resp.data["totals"]
+    assert totals["run_count"] == 1
+    assert totals["llm_call_count"] == 1
+    assert totals["input_tokens"] == 100
+    assert totals["output_tokens"] == 50
+    assert Decimal(totals["total_cost_usd"]) == Decimal("0.000030")
+    assert len(resp.data["runs"]) == 1
+    assert len(resp.data["runs"][0]["spans"]) == 1
 
 
 @pytest.mark.django_db
@@ -258,16 +294,19 @@ def test_retry_attempts_are_recorded_as_separate_runs(alice_conversation):
 
 
 @pytest.mark.django_db
-def test_money_is_serialized_as_strings_everywhere(alice, alice_conversation):
+def test_money_is_serialized_as_strings_everywhere(support_agent, alice_conversation):
     """
     Costs go to six decimal places, so a float round-trip would change
     their last digits. Both the aggregate dict and the per-run
     serializer must hand the browser the same type: a string.
+
+    Runs through a support agent because the customer response redacts
+    the per-run list (see test_owner_customer_gets_redacted_usage_payload).
     """
     make_run(alice_conversation, llm_cost="0.000123")
 
     client = APIClient()
-    client.force_authenticate(user=alice)
+    client.force_authenticate(user=support_agent)
     resp = client.get(f"/api/conversations/{alice_conversation.id}/usage/")
 
     assert isinstance(resp.data["totals"]["total_cost_usd"], str)

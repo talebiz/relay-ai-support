@@ -47,9 +47,11 @@ export default function OrdersPage({ onSelectOrder, onGoToDocuments }: OrdersPag
           )}
         </div>
         <div style={{ display: "flex", gap: "8px" }}>
-          <button className="secondary" onClick={onGoToDocuments}>
-            اسناد
-          </button>
+          {isSupportAgent && (
+            <button className="secondary" onClick={onGoToDocuments}>
+              اسناد
+            </button>
+          )}
           <button className="secondary" onClick={logout}>
             خروج
           </button>

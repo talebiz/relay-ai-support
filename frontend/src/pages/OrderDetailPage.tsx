@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchOrderDetail } from "../api/orders";
 import { fetchOrCreateConversation } from "../api/conversations";
+import { useAuth } from "../auth/AuthContext";
 import ChatPanel from "../components/ChatPanel";
 import RefundPanel from "../components/RefundPanel";
 import type { Conversation, Order, OrderStatus } from "../types/domain";
@@ -36,6 +37,8 @@ interface OrderDetailPageProps {
  * is keyed on the latter.
  */
 export default function OrderDetailPage({ orderId, onBack }: OrderDetailPageProps) {
+  const { user } = useAuth();
+  const isSupportAgent = user?.role === "support_agent";
   const [order, setOrder] = useState<Order | null>(null);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -114,6 +117,8 @@ export default function OrderDetailPage({ orderId, onBack }: OrderDetailPageProp
               <ChatPanel
                 conversationId={conversation.id}
                 correlationId={conversation.correlation_id}
+                readOnly={isSupportAgent}
+                showToolDetails={isSupportAgent}
               />
             ) : (
               !error && <p className="muted">در حال آماده‌سازی گفت‌وگو...</p>
