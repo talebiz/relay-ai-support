@@ -30,6 +30,8 @@ urlpatterns = [
     path("api/", include("support.urls")),
     path("api/", include("streaming.urls")),
     path("api/", include("documents.urls")),
+    # --- Part 7: observability & cost ---
+    path("api/", include("observability.urls")),
 ]
 
 

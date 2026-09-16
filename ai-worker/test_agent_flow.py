@@ -13,7 +13,7 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 
-from llm.factory import get_default_chat_model
+from llm.factory import get_default_chat_models
 from graph.agent_graph import build_agent_graph, build_initial_messages, AGENT_RECURSION_LIMIT
 
 print("=== Agent Flow Diagnostic ===\n")
@@ -25,7 +25,7 @@ print(f"Model    : {model_name}\n")
 
 print("[1/4] Building chat model...")
 try:
-    model = get_default_chat_model()
+    models = get_default_chat_models()
     print("  OK\n")
 except Exception as e:
     print(f"  FAILED: {e}")
@@ -37,7 +37,7 @@ ACTING_USER_ID = 1
 
 print("[2/4] Building agent graph with tools...")
 try:
-    graph = build_agent_graph(model, ACTING_USER_ID)
+    graph = build_agent_graph(models, ACTING_USER_ID)
     print("  OK\n")
 except Exception as e:
     print(f"  FAILED: {e}")

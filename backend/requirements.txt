@@ -24,8 +24,12 @@ aio-pika==9.5.0                # Async RabbitMQ client (used by the SSE view to 
 # --- Vector DB client (used later by the retrieval/RAG tool) ---
 chromadb==0.5.23
 
-# --- Observability (optional but recommended per project doc section 7) ---
-langfuse==2.53.9
+# --- Observability (part 7) ---
+# Note: langfuse is NOT listed here on purpose. Traces are produced by
+# the process that actually runs the agent (the ai-worker, which does
+# depend on it); Django only READS the cost ledger out of its own
+# tables, so shipping the SDK in this image would add a dependency
+# nothing here imports.
 
 # --- Dev/testing ---
 pytest==8.3.4

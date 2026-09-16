@@ -117,6 +117,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
+from llm.factory import bind_tools_with_fallback
 from tools.action_tools import make_create_refund_request_tool
 from tools.knowledge_base_tools import make_search_knowledge_base_tool
 from tools.order_tools import make_get_order_info_tool
@@ -201,7 +202,7 @@ def _build_tools_for_run(acting_user_id: int) -> list:
     ]
 
 
-def build_agent_graph(model: BaseChatModel, acting_user_id: int):
+def build_agent_graph(models: list[BaseChatModel], acting_user_id: int):
     """
     Compiles one graph instance for one command, bound to one
     customer's authorization scope.
@@ -212,9 +213,14 @@ def build_agent_graph(model: BaseChatModel, acting_user_id: int):
     command gets its own tool closures, built fresh from the envelope
     payload's acting_user_id (see worker.py's run_agent), with no
     shared mutable state between runs.
+
+    `models` is a LIST (primary first), not a single model, because the
+    fallback chain has to be built AFTER tools are bound - see
+    llm/factory.py::bind_tools_with_fallback, which owns that rule. One
+    element is the no-fallback case and behaves exactly as before.
     """
     tools = _build_tools_for_run(acting_user_id)
-    model_with_tools = model.bind_tools(tools)
+    model_with_tools = bind_tools_with_fallback(models, tools)
 
     def agent_node(state: AgentState) -> dict:
         response = model_with_tools.invoke(state["messages"])

@@ -35,6 +35,12 @@ class MessageType(str, Enum):
     AGENT_RESPONSE_CHUNK = "event.agent_response_chunk"
     AGENT_TOOL_CALLED = "event.agent_tool_called"
     AGENT_RUN_COMPLETED = "event.agent_run_completed"
+    # Part 7 (observability & cost): published once per agent run -
+    # success OR failure - carrying that run's real token counts,
+    # Tavily credits and reference cost, so the UI's cost display
+    # updates live instead of only on the next page load. See
+    # ai-worker/observability/tracing.py::RunSnapshot.to_event_payload.
+    AGENT_RUN_USAGE = "event.agent_run_usage"
     AGENT_RUN_FAILED = "event.agent_run_failed"
 
 

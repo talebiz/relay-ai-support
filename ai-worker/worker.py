@@ -40,6 +40,19 @@ docstring predicted: "Everything AROUND the agent call ... will not
 need to change again when the real graph is added in commit 2 - only
 run_agent's body will."
 
+Part 7 update (رصدپذیری و هزینه): `run_agent` is now a thin wrapper
+that owns this run's OBSERVABILITY, and the work it used to do lives in
+`_execute_agent_run` unchanged. The wrapper builds two observers - the
+local `RunTracer` and, when keys are configured, a Langfuse handler -
+hands both to the graph as callbacks (so every model call and every
+tool call is observed from INSIDE LangChain, not guessed from the
+event stream), and then, in a `finally`, writes one ledger row per run
+plus one row per span to PostgreSQL and publishes a new
+AGENT_RUN_USAGE event carrying the run's real token counts, Tavily
+credits and reference cost. The `finally` matters: a failed or
+timed-out run spent real tokens too, and only counting successful runs
+would report a number below the real bill.
+
 --- The two required answers (project brief, section 3(b)) ---
 
 Q1: "اگر همان فرمان دو بار برسد چه می‌شود؟"
@@ -117,13 +130,16 @@ from db import (
     already_processed,
     fetch_conversation_history,
     fetch_order_for_user,
+    insert_agent_run,
     mark_processed,
     save_assistant_message_with_tool_calls,
 )
 from envelope import Envelope, MessageType
 from events import publish_event
 from graph.agent_graph import AGENT_RECURSION_LIMIT, build_agent_graph, build_initial_messages
-from llm.factory import get_default_chat_model
+from llm.factory import get_default_chat_models
+from observability import langfuse_client
+from observability.tracing import RunTracer
 from topology import DLQ_QUEUE, COMMAND_QUEUE, declare_topology, retry_queue_for_attempt
 
 load_dotenv()
@@ -200,14 +216,21 @@ def _stream_graph_in_background(graph, messages, graph_config, out_queue: queue.
 # so there is no reason to rebuild it on every command. The GRAPH,
 # unlike the model, is rebuilt per command (see build_agent_graph's
 # docstring) because it is scoped to one acting_user_id.
-_chat_model = None
+_chat_models = None
 
 
-def _get_chat_model():
-    global _chat_model
-    if _chat_model is None:
-        _chat_model = get_default_chat_model()
-    return _chat_model
+def _get_chat_models():
+    """
+    The configured models, primary first - one element normally, two
+    when LLM_FALLBACK_PROVIDER is set. Returned UNWIRED: the fallback
+    chain is built per run, after tools are bound, by
+    llm/factory.py::bind_tools_with_fallback (see its docstring for
+    why that order is the only correct one).
+    """
+    global _chat_models
+    if _chat_models is None:
+        _chat_models = get_default_chat_models()
+    return _chat_models
 
 
 def _publish_buffered_delta(channel, buffer: str, correlation_id: str) -> None:
@@ -222,16 +245,125 @@ def _publish_buffered_delta(channel, buffer: str, correlation_id: str) -> None:
 
 def run_agent(channel, envelope: Envelope) -> None:
     """
-    Generate and publish a reply for one PROCESS_USER_MESSAGE command,
-    now by running the real LangGraph agent instead of a single
-    tool-less LLM call.
+    One agent run, wrapped in its execution trace and cost accounting
+    (project brief, section 7: "رصدپذیری و هزینه").
 
-    Steps: publish AGENT_RUN_STARTED -> load conversation history from
-    the database -> build this run's agent graph (tools bound to this
-    command's acting_user_id) -> stream the graph, publishing buffered
-    text deltas AND real tool-call events as they occur -> persist the
-    final text (with its tool-call trace) as a Message row -> publish
-    AGENT_RUN_COMPLETED.
+    This function owns three things `_execute_agent_run` deliberately
+    does not:
+
+      1. AGENT_RUN_STARTED, published here rather than inside the body
+         so the browser sees "the agent started" even if building the
+         trace or the graph itself fails immediately.
+      2. The observers: a `RunTracer` (always) and a Langfuse handler
+         (only when LANGFUSE_* keys are configured). Both are handed to
+         the graph as callbacks, so they observe every model call and
+         every tool call from inside LangChain rather than from our
+         loop - see observability/tracing.py.
+      3. The ledger write, in a `finally`. This is the important part:
+         a run that called the model three times and then hit the
+         wall-clock ceiling spent exactly as many tokens as a
+         successful one, and a cost report that only counted successes
+         would read lower than the real bill. The brief is explicit
+         that "«رایگان بود»" is not an acceptable answer, and neither
+         is "we only count the runs that worked".
+
+    The exception, if any, is re-raised unchanged after the ledger is
+    written, so `handle_command`'s existing retry/backoff/DLQ path
+    (project brief 3(b)) behaves exactly as it did before part 7.
+    """
+    correlation_id = envelope.correlation_id
+    conversation_id = envelope.payload.get("conversation_id")
+    acting_user_id = envelope.payload.get("acting_user_id")
+
+    publish_event(
+        channel,
+        MessageType.AGENT_RUN_STARTED,
+        payload={"acting_user_id": acting_user_id},
+        correlation_id=correlation_id,
+    )
+
+    tracer = RunTracer(
+        correlation_id=correlation_id,
+        conversation_id=conversation_id,
+        command_message_id=envelope.message_id,
+        # The envelope's retry_count at the moment this attempt began:
+        # a retried command runs the agent a second time and spends a
+        # second time, so each attempt gets its own ledger row (see
+        # backend/observability/models.py on the uniqueness constraint).
+        attempt=envelope.retry_count,
+        acting_user_id=acting_user_id,
+    )
+    langfuse_handler = langfuse_client.build_handler(
+        correlation_id=correlation_id,
+        conversation_id=conversation_id,
+        command_message_id=envelope.message_id,
+        attempt=envelope.retry_count,
+        acting_user_id=acting_user_id,
+    )
+    callbacks = [tracer] + ([langfuse_handler] if langfuse_handler is not None else [])
+
+    status = "completed"
+    error_message = ""
+    try:
+        _execute_agent_run(channel, envelope, callbacks)
+    except BaseException as exc:  # noqa: BLE001 - re-raised below, never swallowed
+        status = "failed"
+        error_message = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        _record_run(channel, tracer, langfuse_handler, status, error_message)
+
+
+def _record_run(channel, tracer: RunTracer, langfuse_handler, status: str, error_message: str) -> None:
+    """
+    Close out one run's observability: flush Langfuse, write the
+    PostgreSQL ledger row (+ one row per model/tool span), and publish
+    AGENT_RUN_USAGE so the UI's cost display updates live.
+
+    Every step is best-effort and independently guarded. This runs in
+    a `finally` - frequently while an exception is already on its way
+    to the retry/DLQ path - and a failure to RECORD what happened must
+    never change WHAT happened. The run's real outcome has already
+    been decided by the time we get here.
+    """
+    try:
+        langfuse_client.flush(langfuse_handler)
+        snapshot = tracer.snapshot(
+            status=status,
+            error_message=error_message,
+            trace_url=langfuse_client.trace_url(langfuse_handler),
+        )
+        snapshot.log_summary()
+        insert_agent_run(snapshot)
+
+        publish_event(
+            channel,
+            MessageType.AGENT_RUN_USAGE,
+            payload=snapshot.to_event_payload(),
+            correlation_id=snapshot.correlation_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker] Failed to record run observability (ignored): {exc}", flush=True)
+
+
+def _execute_agent_run(channel, envelope: Envelope, callbacks: list) -> None:
+    """
+    The actual work of one PROCESS_USER_MESSAGE command: load history,
+    build the graph, stream it, publish events, persist the reply.
+
+    Steps: load conversation history from the database -> build this
+    run's agent graph (tools bound to this command's acting_user_id)
+    -> stream the graph, publishing buffered text deltas AND real
+    tool-call events as they occur -> persist the final text (with its
+    tool-call trace) as a Message row -> publish AGENT_RUN_COMPLETED.
+
+    `callbacks` are LangChain callback handlers (part 7: RunTracer,
+    plus the Langfuse handler when configured) that `run_agent` built
+    and will read back afterwards. They are passed INTO the graph
+    config rather than wrapped around this call because that is the
+    only way to observe what happens INSIDE the graph - per model call
+    and per tool call - rather than just its total duration. See
+    observability/tracing.py's docstring.
 
     Raises to simulate a failure so the retry/backoff/DLQ path is
     exercisable: set payload["text"] to the literal string
@@ -242,13 +374,6 @@ def run_agent(channel, envelope: Envelope) -> None:
     acting_user_id = envelope.payload.get("acting_user_id")
     order_id = envelope.payload.get("order_id")
     user_text = envelope.payload.get("text", "")
-
-    publish_event(
-        channel,
-        MessageType.AGENT_RUN_STARTED,
-        payload={"acting_user_id": acting_user_id},
-        correlation_id=correlation_id,
-    )
 
     if user_text == "__simulate_failure__":
         # Deliberate failure path for demonstrating retry/backoff/DLQ
@@ -266,8 +391,8 @@ def run_agent(channel, envelope: Envelope) -> None:
         order_context = fetch_order_for_user(acting_user_id, order_id)
     messages = build_initial_messages(history, user_text, order_context=order_context)
 
-    model = _get_chat_model()
-    graph = build_agent_graph(model, acting_user_id)
+    models = _get_chat_models()
+    graph = build_agent_graph(models, acting_user_id)
 
     # A fresh thread_id per command: this graph's checkpointer
     # (MemorySaver, see agent_graph.py's docstring) only needs to
@@ -276,6 +401,13 @@ def run_agent(channel, envelope: Envelope) -> None:
     graph_config = {
         "configurable": {"thread_id": envelope.message_id},
         "recursion_limit": AGENT_RECURSION_LIMIT,
+        # Part 7: every model call and every tool call inside this
+        # graph run is observed through these handlers - the local
+        # RunTracer (always) and Langfuse (when configured). Attaching
+        # them here, on the run config, rather than to the model or the
+        # tools individually, is what guarantees nothing inside the
+        # graph can execute untraced.
+        "callbacks": callbacks,
     }
 
     reply_text_parts: list[str] = []

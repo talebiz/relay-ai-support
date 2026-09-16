@@ -67,6 +67,9 @@ INSTALLED_APPS = [
     "support",
     "streaming",
     "documents",
+    # Part 7: execution traces + cost ledger (see observability/models.py).
+    # Django only READS these tables; the AI worker writes them directly.
+    "observability",
 ]
 
 # Custom user model. See accounts/models.py for why this exists even

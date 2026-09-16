@@ -92,7 +92,19 @@ class Message(models.Model):
 
     class Meta:
         ordering = ["created_at"]
-        indexes = [models.Index(fields=["conversation", "created_at"])]
+        # The name is given EXPLICITLY, and must match the name in
+        # migrations/0001_initial.py (and therefore the index that
+        # actually exists in PostgreSQL). Django auto-names an unnamed
+        # index from a hash of the table and columns; this app's
+        # initial migration was hand-written with a readable name
+        # instead, so leaving this unnamed made Django compare a
+        # hashed name against a readable one and report "conversations
+        # has changes not yet reflected in a migration" on every single
+        # `migrate`, forever. Naming it here is a no-op for the
+        # database and makes that permanent false alarm go away.
+        indexes = [
+            models.Index(fields=["conversation", "created_at"], name="conversations_conv_created_idx")
+        ]
 
     def __str__(self):
         return f"Message({self.role}) in {self.conversation_id}"

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { sendMessage } from "../api/conversations";
 import { useConversationStream } from "../hooks/useConversationStream";
+import UsagePanel from "./UsagePanel";
 import type { ChatMessage, StreamConnectionState, ToolCallRecord } from "../types/domain";
 
 interface ChatPanelProps {
@@ -126,6 +127,7 @@ export default function ChatPanel({ conversationId, correlationId }: ChatPanelPr
     resyncMessages,
     awaitingResponse,
     notifyMessageSent,
+    usageVersion,
   } = useConversationStream(conversationId, correlationId);
 
   const [draft, setDraft] = useState("");
@@ -229,6 +231,12 @@ export default function ChatPanel({ conversationId, correlationId }: ChatPanelPr
         </button>
       </form>
       {sendError && <p className="form-error">{sendError}</p>}
+
+      {/* Part 7: the cost/trace panel sits directly under the chat it
+          describes, and re-reads the ledger from the database every
+          time `usageVersion` moves (i.e. whenever a run finishes,
+          successfully or not). */}
+      <UsagePanel conversationId={conversationId} refreshToken={usageVersion} />
     </div>
   );
 }

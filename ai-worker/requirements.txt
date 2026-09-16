@@ -11,8 +11,13 @@ langchain-core==0.3.28
 # API - langchain-openai pointed at a custom base_url is enough for all
 # of them, no separate package per provider needed for that case.
 langchain-openai==0.2.14
-langchain-anthropic==0.3.1
+# Gemini's native API is not OpenAI-shaped, so it needs its own package.
 langchain-google-genai==2.0.7
+# langchain-anthropic was here and was removed: this project only ever
+# targets an OpenAI-compatible endpoint or Gemini (llm/factory.py). To
+# reach Claude models, point openai_compatible at an aggregator such as
+# OpenRouter rather than re-adding a provider branch.
+
 
 # --- Vector store client (part 4 commit 2: tools/knowledge_base_tools.py) ---
 chromadb==0.5.23
@@ -25,8 +30,17 @@ httpx==0.27.2
 #     tools - see db.py) ---
 psycopg[binary]==3.2.3
 
-# --- Observability ---
+# --- Observability & cost (part 7) ---
+# langfuse is OPTIONAL at runtime (no keys -> no Langfuse, everything
+# else still works), but pinned here so the image can use it when keys
+# ARE configured.
 langfuse==2.53.9
+# No tokenizer dependency on purpose. When a provider reports no token
+# usage of its own, observability/tracing.py::estimate_tokens falls
+# back to plain arithmetic rather than tiktoken - see that module's
+# docstring for the three reasons (wrong vocabulary for our model,
+# a network download with no timeout on the worker's hot path, and a
+# path `stream_usage=True` means we never reach anyway).
 
 # --- Environment variables ---
 python-dotenv==1.0.1

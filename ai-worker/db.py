@@ -66,6 +66,7 @@ from contextlib import contextmanager
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 DB_HOST = os.getenv("DB_HOST", "postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
@@ -408,3 +409,149 @@ def insert_refund_request(acting_user_id: int, order_id: str, reason: str) -> di
         "reason": reason,
         "status": "requested",
     }
+
+
+# ---------------------------------------------------------------------
+# Part 7: the cost/trace ledger (backend/observability/models.py)
+# ---------------------------------------------------------------------
+
+
+def _conversation_exists(cursor, conversation_id: str) -> bool:
+    cursor.execute("SELECT 1 FROM conversations_conversation WHERE id = %s", (conversation_id,))
+    return cursor.fetchone() is not None
+
+
+def insert_agent_run(snapshot) -> str | None:
+    """
+    Persist one finished agent run (and every model/tool span inside
+    it) into `observability_agentrun` / `observability_runspan` - the
+    ledger the UI reads to answer "what did this conversation cost?"
+    (project brief section 7).
+
+    Called from worker.py's `run_agent` finally-block, so it runs for
+    failed and timed-out runs too: those spent tokens as surely as a
+    successful one did, and a ledger that only records successes
+    reports a number lower than the real bill.
+
+    Written in plain SQL against Django's tables for the same reason
+    as every other function in this module - the worker is not a
+    Django app (see this file's top docstring). The column list here
+    must stay in sync with backend/observability/models.py by hand;
+    that duplication is the accepted, documented cost of the
+    two-process split, exactly like the duplicated envelope.
+
+    Returns the new run's id, or None if nothing was written. Every
+    failure path returns None rather than raising: this function is
+    called while a run is already finishing (possibly while an
+    exception is propagating toward the retry/DLQ path), and a
+    bookkeeping failure must never replace or mask the real outcome of
+    that run.
+    """
+    run_id = str(uuid.uuid4())
+
+    try:
+        with transaction() as cursor:
+            conversation_id = snapshot.conversation_id
+            if conversation_id and not _conversation_exists(cursor, conversation_id):
+                # The conversation was deleted while the agent was
+                # running. Record the spend anyway, unattached: the
+                # tokens were still burned, and correlation_id still
+                # identifies where.
+                conversation_id = None
+
+            cursor.execute(
+                """
+                INSERT INTO observability_agentrun (
+                    id, conversation_id, correlation_id, command_message_id, attempt,
+                    status, started_at, finished_at, duration_ms,
+                    llm_call_count, tool_call_count,
+                    input_tokens, output_tokens, total_tokens, token_source,
+                    llm_cost_usd, tavily_credits, tavily_cost_usd, total_cost_usd,
+                    trace_url, error_message, created_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, now()
+                )
+                """,
+                (
+                    run_id,
+                    conversation_id,
+                    snapshot.correlation_id,
+                    snapshot.command_message_id,
+                    snapshot.attempt,
+                    snapshot.status,
+                    snapshot.started_at,
+                    snapshot.finished_at,
+                    snapshot.duration_ms,
+                    snapshot.llm_call_count,
+                    snapshot.tool_call_count,
+                    snapshot.input_tokens,
+                    snapshot.output_tokens,
+                    snapshot.total_tokens,
+                    snapshot.token_source,
+                    snapshot.llm_cost_usd,
+                    snapshot.tavily_credits,
+                    snapshot.tavily_cost_usd,
+                    snapshot.total_cost_usd,
+                    (snapshot.trace_url or "")[:500],
+                    snapshot.error_message or "",
+                ),
+            )
+
+            for span in snapshot.spans:
+                row = span.to_dict()
+                cursor.execute(
+                    """
+                    INSERT INTO observability_runspan (
+                        id, run_id, "sequence", span_type, name,
+                        started_at, finished_at, duration_ms,
+                        input_tokens, output_tokens, total_tokens, cost_usd,
+                        status, error_message, detail
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        run_id,
+                        row["sequence"],
+                        row["span_type"],
+                        str(row["name"])[:200],
+                        row["started_at"],
+                        row["finished_at"],
+                        row["duration_ms"],
+                        row["input_tokens"],
+                        row["output_tokens"],
+                        row["total_tokens"],
+                        row["cost_usd"],
+                        str(row["status"])[:20],
+                        row["error_message"],
+                        Json(row["detail"]) if row["detail"] else None,
+                    ),
+                )
+
+        return run_id
+
+    except psycopg.errors.UniqueViolation:
+        # (command_message_id, attempt) already recorded - the only way
+        # this happens is a redelivery that somehow re-ran the same
+        # attempt number. The first row already holds that attempt's
+        # cost; writing a second would double-count it.
+        print(
+            f"[worker] Agent run for {snapshot.command_message_id} "
+            f"attempt {snapshot.attempt} already recorded, skipping ledger write.",
+            flush=True,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - see docstring: never mask the real outcome
+        print(f"[worker] Could not record agent run ledger entry (ignored): {exc}", flush=True)
+        return None

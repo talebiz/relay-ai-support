@@ -60,7 +60,14 @@ class ProcessedMessage(models.Model):
     processed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=["correlation_id"])]
+        # Explicit name, matching migrations/0001_initial.py and the
+        # real index in PostgreSQL - see conversations/models.py for
+        # the full explanation of why an unnamed index here produced a
+        # permanent "messaging has changes not yet reflected in a
+        # migration" warning. The name looks auto-generated because the
+        # hand-written migration imitated Django's format; it is kept
+        # verbatim so no index actually has to be renamed.
+        indexes = [models.Index(fields=["correlation_id"], name="messaging_p_correla_1e5f4a_idx")]
 
     def __str__(self):
         return f"ProcessedMessage({self.message_id})"

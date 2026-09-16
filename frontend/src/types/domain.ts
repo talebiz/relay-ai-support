@@ -138,7 +138,22 @@ export type AgentEvent =
       correlation_id: string;
       payload: { final_text: string; tool_calls: ToolCallRecord[] };
     }
-  | { type: "event.agent_run_failed"; correlation_id: string; payload: { reason: string; retry_count: number } };
+  | { type: "event.agent_run_failed"; correlation_id: string; payload: { reason: string; retry_count: number } }
+  | {
+      /**
+       * Part 7: published once per agent run - success OR failure -
+       * with that run's real token counts, Tavily credits and
+       * reference cost (ai-worker/observability/tracing.py::
+       * RunSnapshot.to_event_payload). The UI treats it as a "the
+       * ledger changed, go re-read it" signal rather than as the
+       * number itself, for the same reason it re-fetches messages
+       * instead of trusting streamed text: the database is the system
+       * of record, the stream only says when.
+       */
+      type: "event.agent_run_usage";
+      correlation_id: string;
+      payload: RunUsageEventPayload;
+    };
 
 
 export type DocumentStatus = "pending" | "indexed" | "failed";
@@ -152,4 +167,108 @@ export interface DocumentInfo {
   chunk_count: number;
   error_message: string;
   created_at: string;
+}
+
+/**
+ * --- Part 7: observability & cost ---
+ *
+ * These mirror backend/observability/serializers.py field for field.
+ *
+ * Every money value is a STRING, not a number, on purpose: the
+ * backend stores costs as fixed-point decimals with 6 places (a
+ * single cheap model call really can cost 0.000042 USD) and DRF
+ * serializes DecimalField as a string so nothing is lost to binary
+ * floating point on the way here. The UI formats these for display
+ * and never sums them - all arithmetic happens in the backend, which
+ * is the only place that can do it exactly.
+ */
+
+export type SpanType = "llm" | "tool";
+
+/** How the token numbers on a run/conversation were obtained. */
+export type TokenSource = "provider" | "estimated" | "mixed" | "none";
+
+export type RunStatus = "running" | "completed" | "failed";
+
+export interface RunSpan {
+  id: string;
+  sequence: number;
+  span_type: SpanType;
+  name: string;
+  started_at: string;
+  duration_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: string;
+  status: string;
+  error_message: string;
+  detail: Record<string, unknown> | null;
+}
+
+export interface AgentRun {
+  id: string;
+  correlation_id: string;
+  command_message_id: string;
+  attempt: number;
+  status: RunStatus;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number;
+  llm_call_count: number;
+  tool_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  token_source: TokenSource;
+  llm_cost_usd: string;
+  tavily_credits: number;
+  tavily_cost_usd: string;
+  total_cost_usd: string;
+  trace_url: string;
+  error_message: string;
+  spans: RunSpan[];
+}
+
+export interface UsageTotals {
+  run_count: number;
+  failed_run_count: number;
+  llm_call_count: number;
+  tool_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  tavily_credits: number;
+  llm_cost_usd: string;
+  tavily_cost_usd: string;
+  total_cost_usd: string;
+  total_duration_ms: number;
+  token_source: TokenSource;
+}
+
+export interface ConversationUsage {
+  conversation_id: string;
+  correlation_id: string;
+  totals: UsageTotals;
+  runs: AgentRun[];
+}
+
+/** Payload of the `event.agent_run_usage` SSE frame. */
+export interface RunUsageEventPayload {
+  correlation_id: string;
+  conversation_id: string | null;
+  status: RunStatus;
+  duration_ms: number;
+  llm_call_count: number;
+  tool_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  token_source: TokenSource;
+  llm_cost_usd: string;
+  tavily_credits: number;
+  tavily_cost_usd: string;
+  total_cost_usd: string;
+  trace_url: string;
+  spans: Array<Omit<RunSpan, "id" | "started_at" | "error_message">>;
 }

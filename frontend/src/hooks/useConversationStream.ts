@@ -88,6 +88,16 @@ export function useConversationStream(conversationId: string | null, correlation
   const [connectionState, setConnectionState] = useState<StreamConnectionState>("connecting");
   const [messagesError, setMessagesError] = useState<string | null>(null);
   const [awaitingResponse, setAwaitingResponse] = useState(false);
+  /**
+   * Part 7: bumped every time a run's cost ledger changes (an
+   * `event.agent_run_usage` frame, or a run that completed/failed).
+   * `UsagePanel` watches this number and re-fetches
+   * /api/conversations/<id>/usage/ when it moves - the cost display
+   * follows the same "stream says WHEN, database says WHAT" rule as
+   * the message list, so a reconnecting tab can never end up showing
+   * a total assembled from whichever events it happened to catch.
+   */
+  const [usageVersion, setUsageVersion] = useState(0);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -206,6 +216,13 @@ export function useConversationStream(conversationId: string | null, correlation
           break;
         }
 
+        case "event.agent_run_usage": {
+          // Published once per run, for failed runs too - a run that
+          // burned tokens and then timed out still changed the bill.
+          setUsageVersion((version) => version + 1);
+          break;
+        }
+
         case "event.agent_run_completed": {
           // The turn is done. Re-fetch from the database rather than
           // trusting the accumulated stream text as final - this is
@@ -216,6 +233,7 @@ export function useConversationStream(conversationId: string | null, correlation
           setLiveTurn(null);
           setAwaitingResponse(false);
           clearAwaitingTimeout();
+          setUsageVersion((version) => version + 1);
           void resyncMessages();
           break;
         }
@@ -225,6 +243,7 @@ export function useConversationStream(conversationId: string | null, correlation
           setAwaitingResponse(false);
           clearAwaitingTimeout();
           setMessagesError(`The assistant could not complete this reply: ${event.payload.reason}`);
+          setUsageVersion((version) => version + 1);
           void resyncMessages();
           break;
         }
@@ -287,6 +306,7 @@ export function useConversationStream(conversationId: string | null, correlation
     setConnectionState("connecting");
     setLiveTurn(null);
     setAwaitingResponse(false);
+    setUsageVersion(0);
     clearAwaitingTimeout();
 
     if (correlationId) {
@@ -327,5 +347,6 @@ export function useConversationStream(conversationId: string | null, correlation
     resyncMessages,
     awaitingResponse,
     notifyMessageSent,
+    usageVersion,
   };
 }

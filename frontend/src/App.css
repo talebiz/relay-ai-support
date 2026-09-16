@@ -517,3 +517,298 @@
   font-size: 14px;
   margin: 0;
 }
+/* --- Part 7: cost & execution-trace panel (UsagePanel.tsx) --- */
+
+/* `.chat-panel` is a fixed-height flex column, so this panel must
+   never grow into the message list's share of it: the header is one
+   fixed row, and the expanded body is height-capped and scrolls
+   itself. See UsagePanel.tsx's docstring on why it starts collapsed. */
+.usage-panel {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.usage-panel-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  font: inherit;
+  color: inherit;
+  /* `start`, not `right`: the app is RTL (index.html dir="rtl"), and
+     this keeps the header correct if that ever changes. */
+  text-align: start;
+  cursor: pointer;
+}
+
+.usage-panel-toggle:hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.usage-caret {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--text-muted);
+  /* Collapsed: point along the reading direction (leftwards in RTL).
+     Expanded: point down at the content it revealed. */
+  transform: rotate(90deg);
+  transition: transform 0.15s ease;
+}
+
+.usage-panel--open .usage-caret {
+  transform: rotate(0deg);
+}
+
+.usage-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.usage-panel-hint {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Keeps the cost hard against the far edge even when the hint above
+   is absent (no runs recorded yet). */
+.usage-panel-hint + .usage-total,
+.usage-panel-title + .usage-total {
+  margin-inline-start: auto;
+}
+
+.usage-panel-body {
+  padding: 4px 16px 16px;
+  max-height: 260px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.usage-total {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+}
+
+.usage-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.usage-stats dt {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.usage-stats dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-subvalue {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted);
+  direction: ltr;
+}
+
+.usage-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.usage-source-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.usage-source--provider .usage-source-badge {
+  background: #e8f5ec;
+  border-color: #b7dfc5;
+  color: #1e7e34;
+}
+
+.usage-source--estimated .usage-source-badge,
+.usage-source--mixed .usage-source-badge {
+  background: #fdf3e0;
+  border-color: #efd7a6;
+  color: #8a5b00;
+}
+
+.usage-source-note {
+  flex: 1;
+  min-width: 180px;
+  line-height: 1.6;
+}
+
+.usage-failed-note {
+  margin: 0 0 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.usage-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.usage-run {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg, transparent);
+}
+
+.usage-run--failed {
+  border-color: var(--danger);
+}
+
+.usage-run > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.usage-run-title {
+  font-weight: 600;
+}
+
+.usage-run-attempt {
+  color: var(--danger);
+  font-weight: 400;
+}
+
+.usage-run-summary {
+  flex: 1;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-run-cost {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+}
+
+.usage-run-body {
+  padding: 0 10px 10px;
+}
+
+.usage-run-ids {
+  margin: 0 0 8px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.usage-run-ids code {
+  direction: ltr;
+  display: inline-block;
+  font-size: 10px;
+}
+
+.usage-run-error {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--danger);
+  word-break: break-word;
+}
+
+.usage-spans {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.03);
+  font-size: 11px;
+}
+
+.usage-span-seq {
+  min-width: 18px;
+  text-align: center;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-span-kind {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.usage-span--llm .usage-span-kind {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+  color: #3730a3;
+}
+
+.usage-span--tool .usage-span-kind {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #166534;
+}
+
+.usage-span--error,
+.usage-span--incomplete {
+  border: 1px solid var(--danger);
+}
+
+.usage-span-name {
+  font-weight: 600;
+  direction: ltr;
+  word-break: break-all;
+}
+
+.usage-span-meta {
+  flex: 1;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-span-cost {
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+}
+
+.usage-span-empty {
+  font-size: 11px;
+}
+
+.usage-trace-link {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 11px;
+}
